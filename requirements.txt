@@ -1,0 +1,9 @@
+requests
+mysql-connector-python
+SQLAlchemy
+Flask
+APScheduler
+python-dotenv
+cryptography
+pymongo
+certifi
