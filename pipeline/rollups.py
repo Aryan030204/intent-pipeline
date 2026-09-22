@@ -462,6 +462,15 @@ def _upsert_rollup_rows(
     deleted_total = 0
     key_cols_sql = ", ".join(key_columns[1:])  # exclude summary_date, handled separately
     for target_date in dates:
+        if len(key_columns) == 1:
+            # Grain is the date alone (intent_daily_summary): the upsert's
+            # UNIQUE KEY(summary_date) already fully owns the single row for
+            # this date, so there is no "extra" stale row a NOT IN cleanup
+            # could ever remove, and an empty computed set here is a
+            # legitimate zero-session day, not a bug. Skip the DELETE
+            # entirely, no warning.
+            continue
+
         computed_keys = computed_keys_by_date.get(target_date, set())
         if not computed_keys:
             logger.warning(
