@@ -24,6 +24,7 @@ upserts with column overwrites - this is what keeps double-processing
 watermark only advances once all five rollups succeed for the run.
 """
 
+import ast
 import hashlib
 import json
 import re
@@ -32,6 +33,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from pipeline.state import IST, logger
+from pipeline.intent_events import _ensure_column_exists
 from pipeline.db import (
     get_db_cursor,
     executemany_chunked,
@@ -46,6 +48,9 @@ ROLLUP_METADATA_KEY = "intent_rollup_last_processed_at"
 ROLLUP_OVERLAP = timedelta(hours=1)
 ROLLUP_DEFAULT_LOOKBACK = timedelta(hours=6)
 ROLLUP_MAX_WINDOW_DAYS = 31
+
+CLICK_VALUE_MAX_LEN = 60
+_VALUE_EXCLUDED_TAGS = {"input", "textarea", "select"}
 
 PAGE_PATH_MAX_LEN = 255
 SEQUENCE_MAX_LEN = 500
@@ -147,6 +152,7 @@ def _ensure_click_behavior_daily_table(cursor, connection) -> None:
             element_name VARCHAR(255) NULL,
             element_type VARCHAR(100) NULL,
             href TEXT NULL,
+            element_value VARCHAR(100) NULL,
 
             total_clicks INT UNSIGNED NOT NULL DEFAULT 0,
             useful_clicks INT UNSIGNED NOT NULL DEFAULT 0,
@@ -165,6 +171,11 @@ def _ensure_click_behavior_daily_table(cursor, connection) -> None:
         """
     )
     connection.commit()
+    # Added after the table first shipped: CREATE TABLE IF NOT EXISTS alone
+    # won't add it to a table that already exists in a brand's database.
+    _ensure_column_exists(
+        cursor, connection, "click_behavior_daily", "element_value", "VARCHAR(100) NULL"
+    )
 
 
 def _ensure_product_behavior_daily_table(cursor, connection) -> None:
@@ -287,19 +298,81 @@ def _normalize_page_path(raw_path: Optional[str]) -> str:
     return path
 
 
+def _normalize_product_id(raw: Any) -> str:
+    """
+    Canonical product id string: "10114912190759.0" and "10114912190759"
+    (cart lists serialize ids as floats) both become "10114912190759".
+    """
+    pid = str(raw).strip().strip("'\"") if raw is not None else ""
+    if pid.endswith(".0"):
+        pid = pid[:-2]
+    return pid
+
+
+def _parse_cart_products(
+    product_id_raw: Optional[str], product_title_raw: Optional[str]
+) -> List[Tuple[str, Optional[str]]]:
+    """
+    checkout_started events store the whole cart as a list-shaped string
+    (e.g. "[10114912190759.0, 9863072350503.0]", titles likewise) because
+    ingestion stringifies non-scalar payload values. Returns the unique
+    (product_id, title) pairs in that cart, or [] if it can't be parsed.
+
+    A value not ending in "]" was truncated by the raw column width, so its
+    last token may be a partial id and is dropped rather than mis-attributed.
+    """
+    text_value = (product_id_raw or "").strip()
+    if not text_value.startswith("["):
+        return []
+    truncated = not text_value.endswith("]")
+    inner = text_value.strip("[]")
+    tokens = [t.strip() for t in inner.split(",") if t.strip()]
+    if truncated and tokens:
+        tokens = tokens[:-1]
+
+    ids = [_normalize_product_id(t) for t in tokens]
+    ids = [i for i in ids if i.isdigit()]
+
+    titles: List[Optional[str]] = []
+    try:
+        parsed_titles = ast.literal_eval((product_title_raw or "").strip())
+        if isinstance(parsed_titles, (list, tuple)):
+            titles = [str(t) for t in parsed_titles]
+    except (ValueError, SyntaxError):
+        titles = []
+
+    result: List[Tuple[str, Optional[str]]] = []
+    seen: Set[str] = set()
+    for idx, pid in enumerate(ids):
+        if pid in seen:
+            continue
+        seen.add(pid)
+        title = titles[idx] if len(titles) == len(ids) else None
+        result.append((pid, title))
+    return result
+
+
 def _normalize_click_target(
     tag_name: Optional[str],
     element_id: Optional[str],
     element_name: Optional[str],
     element_type: Optional[str],
     href: Optional[str],
-) -> Tuple[str, str, str, str, str, str]:
+    element_value: Optional[str] = None,
+) -> Tuple[str, str, str, str, str, str, str]:
     """
     Reusable click-target normalization. Returns
-    (tag_name, element_id, element_name, element_type, normalized_href, click_target_hash).
+    (tag_name, element_id, element_name, element_type, normalized_href,
+     element_value, click_target_hash).
     The hash (MD5 - display-grouping only, not business-metric identity) is
-    what bounds cardinality in click_behavior_daily's UNIQUE KEY; the four
-    raw-ish fields are kept for dashboard readability.
+    what bounds cardinality in click_behavior_daily's UNIQUE KEY; the raw-ish
+    fields are kept for dashboard readability.
+
+    element_value (the clicked element's text/value) is what separates
+    otherwise-anonymous elements (e.g. many different <div>s with no id/name)
+    into distinct targets. It is whitespace-collapsed, lowercased and capped,
+    and is deliberately ignored for input/textarea/select tags, whose value
+    can be user-typed text.
     """
     def _clean(v: Optional[str]) -> str:
         return (str(v).strip().lower()) if v not in (None, "") else ""
@@ -313,10 +386,14 @@ def _normalize_click_target(
     if href_path == "(unknown)":
         href_path = ""
 
-    key_material = "|".join([tag, eid, ename, etype, href_path])
+    value = ""
+    if tag not in _VALUE_EXCLUDED_TAGS and element_value:
+        value = " ".join(str(element_value).split()).lower()[:CLICK_VALUE_MAX_LEN]
+
+    key_material = "|".join([tag, eid, ename, etype, href_path, value])
     click_target_hash = hashlib.md5(key_material.encode("utf-8")).hexdigest()
 
-    return (tag, eid, ename, etype, href_path, click_target_hash)
+    return (tag, eid, ename, etype, href_path, value, click_target_hash)
 
 
 def _compute_sequence_path(event_sequence_raw: Any) -> Tuple[str, str, int]:
@@ -748,13 +825,14 @@ def _rollup_click_behavior_daily(cursor, connection, dates: List[date]) -> Dict[
             DATE(occurred_at) AS d,
             SUBSTRING_INDEX(SUBSTRING_INDEX(url, '?', 1), '#', 1) AS raw_path,
             click_tag, click_element_id, click_element_name, click_element_type, click_href,
+            LEFT(click_element_value, 200) AS element_value,
             COUNT(*) AS total_clicks,
             SUM(click_bucket = 'useful_click') AS useful_clicks,
             SUM(click_bucket = 'dead_click') AS dead_clicks
         FROM click_events
         WHERE occurred_at >= %s AND occurred_at < %s
         GROUP BY DATE(occurred_at), raw_path, click_tag, click_element_id,
-                 click_element_name, click_element_type, click_href
+                 click_element_name, click_element_type, click_href, element_value
         """,
         (range_start, range_end),
     )
@@ -765,15 +843,15 @@ def _rollup_click_behavior_daily(cursor, connection, dates: List[date]) -> Dict[
 
     for r in grouped_rows:
         norm_path = _normalize_page_path(r["raw_path"])
-        tag, eid, ename, etype, href, target_hash = _normalize_click_target(
+        tag, eid, ename, etype, href, value, target_hash = _normalize_click_target(
             r["click_tag"], r["click_element_id"], r["click_element_name"],
-            r["click_element_type"], r["click_href"],
+            r["click_element_type"], r["click_href"], r["element_value"],
         )
         key = (r["d"], norm_path, target_hash)
         if key not in merged:
             merged[key] = {
                 "tag_name": tag, "element_id": eid, "element_name": ename,
-                "element_type": etype, "href": href,
+                "element_type": etype, "href": href, "element_value": value,
                 "total_clicks": 0, "useful_clicks": 0, "dead_clicks": 0,
             }
         b = merged[key]
@@ -789,7 +867,7 @@ def _rollup_click_behavior_daily(cursor, connection, dates: List[date]) -> Dict[
         dead_click_rate = _safe_div(b["dead_clicks"], b["total_clicks"])
         rows.append((
             target_date, page_path, target_hash, b["tag_name"], b["element_id"],
-            b["element_name"], b["element_type"], b["href"],
+            b["element_name"], b["element_type"], b["href"], b["element_value"] or None,
             b["total_clicks"], b["useful_clicks"], b["dead_clicks"],
             useful_click_rate, dead_click_rate,
         ))
@@ -798,15 +876,16 @@ def _rollup_click_behavior_daily(cursor, connection, dates: List[date]) -> Dict[
     insert_sql = """
         INSERT INTO click_behavior_daily (
             summary_date, page_path, click_target_hash, tag_name, element_id,
-            element_name, element_type, href, total_clicks, useful_clicks,
+            element_name, element_type, href, element_value, total_clicks, useful_clicks,
             dead_clicks, useful_click_rate, dead_click_rate
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             tag_name = VALUES(tag_name),
             element_id = VALUES(element_id),
             element_name = VALUES(element_name),
             element_type = VALUES(element_type),
             href = VALUES(href),
+            element_value = VALUES(element_value),
             total_clicks = VALUES(total_clicks),
             useful_clicks = VALUES(useful_clicks),
             dead_clicks = VALUES(dead_clicks),
@@ -834,6 +913,9 @@ def _rollup_product_behavior_daily(cursor, connection, dates: List[date]) -> Dic
     started_at = time.monotonic()
     range_start, range_end = _window_bounds(dates)
 
+    # Single-product events (product_viewed, add-to-cart): product_id is one
+    # plain ID. checkout_started events instead carry the WHOLE CART as a
+    # list-shaped string ("[123.0, 456.0]"), handled separately below.
     cursor.execute(
         """
         SELECT
@@ -848,28 +930,93 @@ def _rollup_product_behavior_daily(cursor, connection, dates: List[date]) -> Dic
         FROM behavioral_events
         WHERE occurred_at >= %s AND occurred_at < %s
               AND product_id IS NOT NULL AND product_id <> ''
+              AND LEFT(product_id, 1) <> '['
         GROUP BY DATE(occurred_at), product_id
         """,
         (range_start, range_end),
     )
     agg_rows = cursor.fetchall()
-    scanned = sum(r["product_views"] for r in agg_rows) if agg_rows else 0
+
+    cursor.execute(
+        """
+        SELECT
+            DATE(occurred_at) AS d,
+            product_id,
+            ANY_VALUE(product_title) AS product_title,
+            COUNT(*) AS checkouts
+        FROM behavioral_events
+        WHERE occurred_at >= %s AND occurred_at < %s
+              AND event_name = 'checkout_started'
+              AND LEFT(product_id, 1) = '['
+        GROUP BY DATE(occurred_at), product_id
+        """,
+        (range_start, range_end),
+    )
+    cart_rows = cursor.fetchall()
+    scanned = (
+        sum(int(r["product_views"] or 0) for r in agg_rows)
+        + sum(r["checkouts"] for r in cart_rows)
+    )
+
+    merged: Dict[Tuple[date, str], Dict[str, Any]] = {}
+
+    def _product_bucket(target_date: date, product_id: str) -> Dict[str, Any]:
+        key = (target_date, product_id)
+        if key not in merged:
+            merged[key] = {
+                "title": None, "views": 0, "viewers": 0, "sessions": 0,
+                "atc": 0, "checkouts": 0,
+            }
+        return merged[key]
+
+    for r in agg_rows:
+        pid = _normalize_product_id(r["product_id"])
+        if not pid:
+            continue
+        b = _product_bucket(r["d"], pid)
+        b["title"] = b["title"] or r["product_title"]
+        b["views"] += int(r["product_views"] or 0)
+        b["viewers"] += int(r["unique_viewers"] or 0)
+        b["sessions"] += int(r["unique_sessions"] or 0)
+        b["atc"] += int(r["add_to_cart_count"] or 0)
+        b["checkouts"] += int(r["checkout_started_count"] or 0)
+
+    unparsed_carts = 0
+    for r in cart_rows:
+        parsed = _parse_cart_products(r["product_id"], r["product_title"])
+        if not parsed:
+            unparsed_carts += r["checkouts"]
+            continue
+        for pid, title in parsed:
+            b = _product_bucket(r["d"], pid)
+            b["title"] = b["title"] or title
+            b["checkouts"] += r["checkouts"]
+    if unparsed_carts:
+        logger.warning(
+            "[rollup product_behavior_daily] %s checkout_started event(s) had unparseable "
+            "cart product_id lists and were not attributed to products",
+            unparsed_carts,
+        )
 
     rows: List[Tuple] = []
     computed_keys_by_date: Dict[date, Set[Tuple]] = {d: set() for d in dates}
 
-    for r in agg_rows:
-        product_views = int(r["product_views"] or 0)
-        view_to_atc_rate = _safe_div(r["add_to_cart_count"], product_views)
-        view_to_checkout_rate = _safe_div(r["checkout_started_count"], product_views)
-        unique_sessions = int(r["unique_sessions"] or 0)
+    for (target_date, pid), b in merged.items():
+        # Rates can exceed 1 (ATC/checkout without a same-day view); cap so a
+        # skewed ratio can never overflow DECIMAL(6, 4) and fail the whole batch.
+        view_to_atc_rate = _safe_div(b["atc"], b["views"])
+        view_to_checkout_rate = _safe_div(b["checkouts"], b["views"])
+        if view_to_atc_rate is not None:
+            view_to_atc_rate = min(view_to_atc_rate, 99.9999)
+        if view_to_checkout_rate is not None:
+            view_to_checkout_rate = min(view_to_checkout_rate, 99.9999)
         rows.append((
-            r["d"], r["product_id"], r["product_title"], product_views,
-            r["unique_viewers"], unique_sessions, unique_sessions,
-            r["add_to_cart_count"], r["checkout_started_count"],
+            target_date, pid, (b["title"] or None), b["views"],
+            b["viewers"], b["sessions"], b["sessions"],
+            b["atc"], b["checkouts"],
             view_to_atc_rate, view_to_checkout_rate,
         ))
-        computed_keys_by_date[r["d"]].add((r["product_id"],))
+        computed_keys_by_date[target_date].add((pid,))
 
     insert_sql = """
         INSERT INTO product_behavior_daily (
