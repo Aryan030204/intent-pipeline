@@ -54,12 +54,16 @@ from intent_engine.runner import run_intent_scoring_pipeline, run_intent_calibra
 
 def _run_scheduled() -> None:
     """
-    Runs the scoring pipeline once immediately on startup (so a
-    redeploy/restart doesn't wait up to 2 hours for fresh scores), then
+    Runs both the scoring pipeline and the calibration pipeline once
+    immediately on startup (so a redeploy/restart doesn't wait up to 2
+    hours - or a full day, for calibration - for fresh results), then
     schedules both jobs on their own cron triggers from that point on.
-    Calibration is deliberately NOT run immediately on startup - it's a
-    once-daily, date-targeted job; running it redundantly on every restart
-    is harmless (idempotent) but unnecessary, so it's left to its cron only.
+    Each immediate run is independently try/excepted so one failing
+    doesn't block the other. Both are safe to run redundantly on every
+    restart: scoring only ever recomputes sessions in its watermark
+    window, and calibration only ever recomputes "yesterday" and always
+    overwrites with the same numbers if nothing has changed since the
+    last run - see intent_engine/INTENT_SCORING.md.
 
     Set INTENT_SCORING_WORKER_SELF_RUN=false to instead run the scoring
     pipeline once and exit (e.g. for a one-off/manual invocation).
@@ -71,6 +75,12 @@ def _run_scheduled() -> None:
         run_intent_scoring_pipeline()
     except Exception as e:
         logger.error("Error in immediate startup run of intent scoring pipeline: %s", e)
+
+    logger.info("Running intent calibration pipeline once immediately on startup")
+    try:
+        run_intent_calibration_pipeline()
+    except Exception as e:
+        logger.error("Error in immediate startup run of intent calibration pipeline: %s", e)
 
     scheduler = BlockingScheduler(timezone="Asia/Kolkata")
     scheduler.add_job(

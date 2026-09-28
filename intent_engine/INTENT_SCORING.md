@@ -25,6 +25,8 @@ There are two separate scheduled jobs. This split exists specifically so that a 
 
 Both jobs run in their **own container** (`intent-scoring-worker`, built from `Dockerfile.intent-scoring-worker`, entrypoint `workers/intent_scoring_worker.py`) — separate from the `intent-data-aggregation` container that handles raw ingestion and the daily/rollup layer. They share the same code, database, and `.env` file, but run as an independent process with its own scheduler, so a restart or resource issue on one side doesn't affect the other.
 
+Both jobs also run **once immediately whenever that container starts or restarts**, in addition to their regular schedule — so a redeploy or reboot doesn't leave scores or thresholds stale for up to 2 hours (or a full day, for calibration) while waiting for the next scheduled tick. Running either job again right after it just ran is harmless: scoring only touches its own incremental watermark window, and calibration always recomputes "yesterday" from scratch and overwrites with the same result if nothing has changed.
+
 **Why not recalculate the boundary every 2 hours?** Because the boundary (the percentile thresholds) is a property of the *whole day's* traffic. If you recompute it every 2 hours, sessions scored at 10 AM could silently flip from "High" to "Medium" by 6 PM just because more traffic arrived later — with no change in their own behavior. That's confusing and not idempotent. Instead: score continuously through the day using **yesterday's** (or the most recent known) thresholds as a working baseline, then once the day is fully over, calibrate it properly and do one clean pass to fix up that day's buckets.
 
 ## 3. What gets excluded before scoring even starts
