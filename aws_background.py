@@ -665,6 +665,7 @@ if __name__ == "__main__":
 
     logger.info("   - Database connections: Lazy short-lived mysql.connector + SQLAlchemy NullPool")
     logger.info("   - Manual Trigger API: POST /trigger (port 5000)")
+    logger.info("   - Intent scoring/calibration: run in the intent-scoring-worker container")
 
     try:
         # Run the Flask app (replaces the sleep loop)

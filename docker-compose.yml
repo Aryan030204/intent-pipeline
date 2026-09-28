@@ -15,3 +15,16 @@ services:
       - pipeline-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  intent-scoring-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.intent-scoring-worker
+    container_name: intent-scoring-worker
+    env_file:
+      - .env
+    restart: always
+    networks:
+      - pipeline-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
