@@ -59,7 +59,7 @@ def _mapped_brands():
 
 def _run_scoring_for_brand(brand_index: int, brand_label: str) -> None:
     with get_db_cursor(brand_index) as (cursor, connection):
-        _ensure_scoring_schema(cursor, connection)
+        _ensure_scoring_schema(brand_index, cursor, connection)
 
         now = datetime.now(IST)
         stored_watermark = get_pipeline_metadata_timestamp(cursor, SCORING_METADATA_KEY)
@@ -116,7 +116,7 @@ def run_intent_scoring_pipeline() -> None:
 
 def _run_calibration_for_brand(brand_index: int, brand_label: str, target_date) -> None:
     with get_db_cursor(brand_index) as (cursor, connection):
-        _ensure_scoring_schema(cursor, connection)
+        _ensure_scoring_schema(brand_index, cursor, connection)
         now = datetime.now(IST)
         affected_actor_ids = calibrate_date_for_brand(cursor, connection, target_date, now)
         if affected_actor_ids:

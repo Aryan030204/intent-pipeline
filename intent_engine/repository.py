@@ -8,11 +8,27 @@ Reuses pipeline/intent_events.py's _ensure_column_exists and
 pipeline/db.py's executemany_chunked - imported, never modified.
 """
 
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import threading
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from pipeline.state import IST
 from pipeline.intent_events import _ensure_column_exists
 from pipeline.db import executemany_chunked
+
+
+def _day_bounds(target_date: date) -> Tuple[datetime, datetime]:
+    """
+    [start, end) datetime bounds for a calendar date, IST wall-clock -
+    mirrors the already-proven pattern in pipeline/rollups.py's
+    _date_range_bounds (private to that module, so duplicated here rather
+    than imported). Used to turn `DATE(session_start) = ?` predicates
+    (which defeat idx_session_start by wrapping it in a function) into a
+    sargable `session_start >= ? AND session_start < ?` range that MySQL
+    can actually use the index for.
+    """
+    start = datetime.combine(target_date, datetime.min.time(), tzinfo=IST)
+    return start, start + timedelta(days=1)
 
 
 # ---------------------------
@@ -80,20 +96,39 @@ _SCORING_COLUMNS_ON_INTENT_SESSIONS = (
 )
 
 
-def _ensure_scoring_schema(cursor, connection) -> None:
+_schema_ensured_lock = threading.Lock()
+_schema_ensured_brands: Set[int] = set()
+
+
+def _ensure_scoring_schema(brand_index: int, cursor, connection) -> None:
     """
     Adds the intent-scoring columns to the EXISTING intent_sessions table
     (owned by pipeline/intent_events.py, which is never modified - this
     reuses that module's own idempotent _ensure_column_exists helper) and
-    creates the two new scoring tables. Called at the start of every
-    scoring/calibration run, same pattern as pipeline/rollups.py's
-    _ensure_all_rollup_tables.
+    creates the two new scoring tables.
+
+    Cached per brand_index for the lifetime of this process: the schema
+    only needs to be checked once (these are idempotent, unchanging
+    additions), but this was previously called unconditionally on every
+    single run of both the 2-hour scoring job and the daily calibration
+    job - 8x SHOW COLUMNS + 2x CREATE TABLE IF NOT EXISTS every time,
+    forever, on an already I/O-constrained instance. The lock guards the
+    cache since both jobs process brands concurrently via
+    ThreadPoolExecutor within the same process. A process restart
+    naturally re-checks once, which is correct and cheap.
     """
+    with _schema_ensured_lock:
+        if brand_index in _schema_ensured_brands:
+            return
+
     for column_name, column_def in _SCORING_COLUMNS_ON_INTENT_SESSIONS:
         _ensure_column_exists(cursor, connection, "intent_sessions", column_name, column_def)
 
     _ensure_intent_actors_table(cursor, connection)
     _ensure_intent_thresholds_daily_table(cursor, connection)
+
+    with _schema_ensured_lock:
+        _schema_ensured_brands.add(brand_index)
 
 
 # ---------------------------
@@ -169,6 +204,16 @@ def bulk_update_scored_sessions(cursor, connection, rows: List[Tuple]) -> int:
     session_id) - session_id LAST, matching the WHERE clause. Every column
     is an overwrite (never an increment) - safe to re-run over the same
     sessions any number of times.
+
+    `updated_at = updated_at` is deliberate: intent_sessions.updated_at has
+    ON UPDATE CURRENT_TIMESTAMP (pipeline/intent_events.py, unmodified), and
+    that same column is what fetch_eligible_sessions uses as the
+    incremental watermark. Without this, every scoring write would bump
+    updated_at, which would re-qualify that same session as "newly
+    eligible" on the very next run - a self-perpetuating loop where every
+    session ever scored stays eligible forever. Explicitly assigning a
+    column back to itself in the SET list is how MySQL lets you suppress
+    the automatic ON UPDATE behavior for one statement.
     """
     if not rows:
         return 0
@@ -180,14 +225,20 @@ def bulk_update_scored_sessions(cursor, connection, rows: List[Tuple]) -> int:
             entry_page_type = %s,
             intent_status = %s,
             intent_scored_at = %s,
-            intent_score_version = %s
+            intent_score_version = %s,
+            updated_at = updated_at
         WHERE session_id = %s
     """
     return executemany_chunked(cursor, connection, sql, rows)
 
 
 def bulk_update_excluded_sessions(cursor, connection, rows: List[Tuple]) -> int:
-    """rows: (exclusion_reason, intent_scored_at, intent_score_version, session_id)."""
+    """
+    rows: (exclusion_reason, intent_scored_at, intent_score_version, session_id).
+    See bulk_update_scored_sessions's docstring for why updated_at = updated_at
+    is required here too - the same watermark-loop risk applies to excluded
+    sessions.
+    """
     if not rows:
         return 0
     sql = """
@@ -199,7 +250,8 @@ def bulk_update_excluded_sessions(cursor, connection, rows: List[Tuple]) -> int:
             intent_status = 'excluded',
             intent_exclusion_reason = %s,
             intent_scored_at = %s,
-            intent_score_version = %s
+            intent_score_version = %s,
+            updated_at = updated_at
         WHERE session_id = %s
     """
     return executemany_chunked(cursor, connection, sql, rows)
@@ -226,27 +278,29 @@ def fetch_thresholds_up_to(cursor, max_date: date, limit: int = 400) -> List[Dic
 # Threshold calibration (write path, used by the daily job)
 # ---------------------------
 def fetch_dead_click_rates_for_date(cursor, target_date: date, max_rows: int) -> List[Tuple[int, int]]:
+    start, end = _day_bounds(target_date)
     cursor.execute(
         """
         SELECT dead_click_count, click_count
         FROM intent_sessions
-        WHERE DATE(session_start) = %s AND click_count >= 10
+        WHERE session_start >= %s AND session_start < %s AND click_count >= 10
         LIMIT %s
         """,
-        (target_date, max_rows),
+        (start, end, max_rows),
     )
     return [(r["dead_click_count"] or 0, r["click_count"]) for r in cursor.fetchall()]
 
 
 def fetch_scored_predictive_scores_for_date(cursor, target_date: date, max_rows: int) -> List[float]:
+    start, end = _day_bounds(target_date)
     cursor.execute(
         """
         SELECT predictive_score
         FROM intent_sessions
-        WHERE DATE(session_start) = %s AND intent_status = 'scored'
+        WHERE session_start >= %s AND session_start < %s AND intent_status = 'scored'
         LIMIT %s
         """,
-        (target_date, max_rows),
+        (start, end, max_rows),
     )
     return [float(r["predictive_score"]) for r in cursor.fetchall() if r["predictive_score"] is not None]
 
@@ -279,6 +333,7 @@ def upsert_daily_thresholds(
 def bulk_reassign_buckets_for_date(
     cursor, connection, target_date: date, p35: float, p72: float,
 ) -> int:
+    start, end = _day_bounds(target_date)
     cursor.execute(
         """
         UPDATE intent_sessions
@@ -291,23 +346,25 @@ def bulk_reassign_buckets_for_date(
                      OR add_to_cart_count > 0 THEN 'high'
                 WHEN predictive_score < %s THEN 'low'
                 WHEN predictive_score < %s THEN 'medium'
-                ELSE 'high' END
-        WHERE intent_status = 'scored' AND DATE(session_start) = %s
+                ELSE 'high' END,
+            updated_at = updated_at
+        WHERE intent_status = 'scored' AND session_start >= %s AND session_start < %s
         """,
-        (p35, p72, p35, p72, target_date),
+        (p35, p72, p35, p72, start, end),
     )
     connection.commit()
     return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
 
 def fetch_actor_ids_scored_on_date(cursor, target_date: date) -> List[str]:
+    start, end = _day_bounds(target_date)
     cursor.execute(
         """
         SELECT DISTINCT actor_id
         FROM intent_sessions
-        WHERE DATE(session_start) = %s AND intent_status = 'scored'
+        WHERE session_start >= %s AND session_start < %s AND intent_status = 'scored'
         """,
-        (target_date,),
+        (start, end),
     )
     return [r["actor_id"] for r in cursor.fetchall()]
 
