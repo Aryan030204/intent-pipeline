@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "type": "click",
+  "message_key": "shu-1",
+  "brand_id": "bbb_shop",
+  "event_id": "shu-1",
+  "event_name": "click",
+  "actor_id": "actor-1",
+  "client_id": "cid-1",
+  "visitor_id": "vid-1",
+  "session_id": "sess-1",
+  "occurred_at": "2026-10-04T06:07:53.497Z",
+  "url": "https://blabliblulife.com/cart",
+  "referrer": "https://instagram.com/",
+  "user_agent": "UA",
+  "session_start": "2026-10-04T06:00:00.000Z",
+  "session_end": null,
+  "session_time_spent": null,
+  "click": {
+    "x": 266,
+    "y": 598,
+    "tag_name": "BUTTON",
+    "element_id": "add",
+    "element_name": null,
+    "element_type": "submit",
+    "element_value": null,
+    "href": null
+  },
+  "signals": {
+    "url_changed": false,
+    "cart_changed": true,
+    "ui_changed": false,
+    "meaningful_scroll": false
+  },
+  "click_bucket": "useful_click",
+  "raw": {
+    "event_id": "shu-1"
+  }
+}
