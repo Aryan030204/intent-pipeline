@@ -35,13 +35,12 @@ services:
       dockerfile: Dockerfile.intent-scoring-worker
     container_name: intent-sqs-worker
     command: ["python", "workers/intent_sqs_worker.py"]
-    profiles: ["sqs-worker"]
     env_file:
       - .env
     environment:
       INTENT_SQS_WRITE_MODE: dry_run
       AWS_REGION: ap-south-1
-    restart: "no"
+    restart: always
     networks:
       - pipeline-net
     extra_hosts:
