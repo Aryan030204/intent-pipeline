@@ -62,9 +62,17 @@ _CURSOR_UPSERT_SQL = (
 )
 
 
+REQUIRED_PRIMARY_KEYS = {
+    CURSOR_TABLE: ("actor_id",),
+    ATC_TABLE: ("session_id", "product_id"),
+}
+REQUIRED_SESSION_COLUMN_TYPE = "datetime(6)"
+
+
 def verify_state_schema(cursor) -> None:
-    """Read-only. Raises SchemaMissing if a required table or column is absent.
-    Runs once per database per process and never issues DDL."""
+    """Read-only. Raises SchemaMissing when a required table is absent, a required
+    primary key differs from the migration, or intent_sessions.source_updated_at is
+    missing or not DATETIME(6). Runs once per database per process; never issues DDL."""
     cursor.execute("SELECT DATABASE() AS db")
     row = cursor.fetchone()
     db = (row.get("db") if isinstance(row, dict) else row[0]) if row else None
@@ -82,13 +90,37 @@ def verify_state_schema(cursor) -> None:
         raise SchemaMissing(f"missing tables {missing}; apply {MIGRATION_FILE} first")
 
     cursor.execute(
-        "SELECT column_name AS name FROM information_schema.columns "
+        "SELECT table_name AS tbl, column_name AS col FROM information_schema.statistics "
+        "WHERE table_schema = DATABASE() AND index_name = 'PRIMARY' AND table_name IN (%s, %s) "
+        "ORDER BY table_name, seq_in_index",
+        REQUIRED_TABLES,
+    )
+    actual_pk: Dict[str, List[str]] = {t: [] for t in REQUIRED_TABLES}
+    for r in cursor.fetchall():
+        tbl = r.get("tbl") if isinstance(r, dict) else r[0]
+        col = r.get("col") if isinstance(r, dict) else r[1]
+        actual_pk.setdefault(tbl, []).append(col)
+    for table, expected in REQUIRED_PRIMARY_KEYS.items():
+        if tuple(actual_pk.get(table, [])) != expected:
+            raise SchemaMissing(
+                f"{table} primary key is {tuple(actual_pk.get(table, []))}, expected {expected}; "
+                f"refusing to write (see {MIGRATION_FILE})"
+            )
+
+    cursor.execute(
+        "SELECT column_type AS ctype FROM information_schema.columns "
         "WHERE table_schema = DATABASE() AND table_name = 'intent_sessions' AND column_name = %s",
         (REQUIRED_SESSION_COLUMN,),
     )
-    if not cursor.fetchall():
+    rows = cursor.fetchall()
+    if not rows:
         raise SchemaMissing(
             f"intent_sessions.{REQUIRED_SESSION_COLUMN} is missing; apply {MIGRATION_FILE} first"
+        )
+    ctype = rows[0].get("ctype") if isinstance(rows[0], dict) else rows[0][0]
+    if str(ctype).lower() != REQUIRED_SESSION_COLUMN_TYPE:
+        raise SchemaMissing(
+            f"intent_sessions.{REQUIRED_SESSION_COLUMN} is {ctype}, expected {REQUIRED_SESSION_COLUMN_TYPE}"
         )
 
     _verified_databases.add(db)

@@ -90,8 +90,10 @@ class FakeCursor:
         last = self._last or ""
         if "information_schema.tables" in last:
             return [("intent_actor_cursors",), ("intent_atc_dedupe",)]
+        if "information_schema.statistics" in last:
+            return [("intent_actor_cursors", "actor_id"), ("intent_atc_dedupe", "session_id"), ("intent_atc_dedupe", "product_id")]
         if "information_schema.columns" in last:
-            return [("source_updated_at",)] if self._source_column_present else []
+            return [("datetime(6)",)] if self._source_column_present else []
         return []
 
     def close(self):

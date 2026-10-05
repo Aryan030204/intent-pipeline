@@ -276,8 +276,12 @@ def test_state_modules_do_not_reference_mongo_or_outbox(): # 15, 16
 
 
 class SchemaOkCursor:
-    """Answers the read-only schema checks as if the migration had been applied."""
+    """Answers the read-only schema checks as if the migration had been applied.
+    Overrides let a test describe a specific wrong schema."""
     rowcount = 0
+    pk_rows = [("intent_actor_cursors", "actor_id"), ("intent_atc_dedupe", "session_id"), ("intent_atc_dedupe", "product_id")]
+    source_type = [("datetime(6)",)]
+    tables = [("intent_actor_cursors",), ("intent_atc_dedupe",)]
 
     def __init__(self):
         self.sql = []
@@ -292,9 +296,11 @@ class SchemaOkCursor:
 
     def fetchall(self):
         if "information_schema.tables" in self._last:
-            return [("intent_actor_cursors",), ("intent_atc_dedupe",)]
+            return list(self.tables)
+        if "information_schema.statistics" in self._last:
+            return list(self.pk_rows)
         if "information_schema.columns" in self._last:
-            return [("source_updated_at",)]
+            return list(self.source_type)
         return []
 
     def executemany(self, sql, rows):
@@ -359,7 +365,7 @@ def test_schema_is_verified_once_per_database_not_per_batch(): # correction 2
     apply_batch(cur, Conn(), parse([event("e-2", 10)]))
     apply_batch(cur, Conn(), parse([event("e-3", 20)]))
     checks_after_all = sum("information_schema" in q for q in cur.sql)
-    assert checks_after_first == 2  # tables + column, read-only, once
+    assert checks_after_first == 3  # tables, primary keys, column type: read-only, once
     assert checks_after_all == checks_after_first
 
 
@@ -479,3 +485,59 @@ def test_gid_and_normalized_atc_are_deduped_as_the_same_product(): # correction 
         event("a-2", 30, name="product_added_to_cart", raw={"product_id": "Product:9"}),
     ])
     assert "a-1" in store.events and "a-2" not in store.events
+
+
+# ---- verifier: correct / missing / incorrect primary key / wrong type ----
+
+def _verify_with(cursor_cls):
+    from pipeline.intent_sqs_store import reset_schema_verification, verify_state_schema
+
+    reset_schema_verification()
+    verify_state_schema(cursor_cls())
+
+
+def test_verifier_passes_on_correct_schema(): # verifier: correct schema
+    _verify_with(SchemaOkCursor)
+
+
+def test_verifier_fails_on_missing_table(): # verifier: missing table
+    from pipeline.intent_sqs_store import SchemaMissing
+
+    class Missing(SchemaOkCursor):
+        tables = [("intent_actor_cursors",)]
+
+    with pytest.raises(SchemaMissing, match="intent_atc_dedupe"):
+        _verify_with(Missing)
+
+
+def test_verifier_fails_on_incorrect_atc_primary_key(): # verifier: incorrect PK
+    from pipeline.intent_sqs_store import SchemaMissing
+
+    class BadAtcKey(SchemaOkCursor):
+        pk_rows = [("intent_actor_cursors", "actor_id"), ("intent_atc_dedupe", "session_id")]
+
+    with pytest.raises(SchemaMissing, match="intent_atc_dedupe primary key"):
+        _verify_with(BadAtcKey)
+
+
+def test_verifier_fails_on_incorrect_cursor_primary_key(): # verifier: incorrect PK
+    from pipeline.intent_sqs_store import SchemaMissing
+
+    class BadCursorKey(SchemaOkCursor):
+        pk_rows = [
+            ("intent_actor_cursors", "actor_id"), ("intent_actor_cursors", "session_id"),
+            ("intent_atc_dedupe", "session_id"), ("intent_atc_dedupe", "product_id"),
+        ]
+
+    with pytest.raises(SchemaMissing, match="intent_actor_cursors primary key"):
+        _verify_with(BadCursorKey)
+
+
+def test_verifier_fails_on_wrong_source_updated_at_type(): # verifier: wrong type
+    from pipeline.intent_sqs_store import SchemaMissing
+
+    class WrongType(SchemaOkCursor):
+        source_type = [("datetime",)]
+
+    with pytest.raises(SchemaMissing, match=r"expected datetime\(6\)"):
+        _verify_with(WrongType)
