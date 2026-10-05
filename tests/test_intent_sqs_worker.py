@@ -47,11 +47,20 @@ def raw(message, message_id="m-1", receipt="r-1", receive_count="1"):
 
 
 class FakeCursor:
+    """Models the MySQL behaviour the consumer relies on: a unique key makes an
+    INSERT ... ON DUPLICATE KEY UPDATE report rowcount 1 when new and 0 when it
+    is a duplicate. Cursor-state lookups return no row (fresh actors)."""
+
     def __init__(self, source_column_present=True):
+        from pipeline.intent_sqs_store import reset_schema_verification
+
+        reset_schema_verification()
         self.executemany_calls = []
         self.execute_calls = []
         self._source_column_present = source_column_present
         self._last = None
+        self.rowcount = 0
+        self.seen_keys = {}
 
     def executemany(self, sql, rows):
         self.executemany_calls.append((sql, list(rows)))
@@ -59,11 +68,31 @@ class FakeCursor:
     def execute(self, sql, params=None):
         self.execute_calls.append((sql, params))
         self._last = sql
+        self.rowcount = 0
+        for table in ("behavioral_events", "click_events"):
+            if f"INSERT INTO {table} " in sql and "ON DUPLICATE KEY UPDATE event_id" in sql:
+                key = (table, params[0])
+                self.rowcount = 0 if key in self.seen_keys else 1
+                self.seen_keys[key] = True
+        if "INSERT INTO intent_atc_dedupe" in sql:
+            key = ("atc", params[0], params[1])
+            self.rowcount = 0 if key in self.seen_keys else 1
+            self.seen_keys[key] = True
 
     def fetchone(self):
-        if self._last and "SHOW COLUMNS" in self._last:
-            return ("source_updated_at",) if self._source_column_present else None
+        if self._last and "SELECT DATABASE()" in self._last:
+            return ("testdb",)
+        if self._last and "FOR UPDATE" in self._last:
+            return None
         return None
+
+    def fetchall(self):
+        last = self._last or ""
+        if "information_schema.tables" in last:
+            return [("intent_actor_cursors",), ("intent_atc_dedupe",)]
+        if "information_schema.columns" in last:
+            return [("source_updated_at",)] if self._source_column_present else []
+        return []
 
     def close(self):
         pass
@@ -255,8 +284,10 @@ def test_H_duplicate_click_is_harmless_by_unique_event_id():
 
 def test_J_mysql_failure_rolls_back_and_does_not_delete():
     class BoomCursor(FakeCursor):
-        def executemany(self, sql, rows):
-            raise RuntimeError("mysql down")
+        def execute(self, sql, params=None):
+            if "INSERT INTO behavioral_events" in sql:
+                raise RuntimeError("mysql down")
+            super().execute(sql, params)
 
     log = []
     cursor, connection = BoomCursor(), FakeConnection()
@@ -298,10 +329,10 @@ def test_K_successful_commit_then_delete():
 
 def test_batch_is_one_commit_across_tables_and_a_later_table_failure_commits_nothing():
     class ClickFailsCursor(FakeCursor):
-        def executemany(self, sql, rows):
+        def execute(self, sql, params=None):
             if "INSERT INTO click_events" in sql:
                 raise RuntimeError("click table locked")
-            super().executemany(sql, rows)
+            super().execute(sql, params)
 
     cursor, connection = ClickFailsCursor(), FakeConnection()
     messages = [

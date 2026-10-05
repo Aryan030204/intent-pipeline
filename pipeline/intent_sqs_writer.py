@@ -9,9 +9,13 @@ Nothing here commits per chunk: the whole batch for one brand commits once, or
 not at all, so the worker can rely on rollback + SQS redelivery.
 """
 
+import os
+import uuid
 from typing import Any, Dict, List
 
 from pipeline.db import EXECUTEMANY_CHUNK_SIZE
+from pipeline.intent_session_state import apply_event, atc_product_id, to_naive_utc
+from pipeline.intent_sqs_store import MySqlIntentStore, verify_state_schema
 from pipeline.intent_events import (
     _BEHAVIORAL_UPSERT_COLUMNS,
     _BEHAVIORAL_UPDATE_COLUMNS,
@@ -28,6 +32,7 @@ from pipeline.intent_sqs_contract import (
     TYPE_CLICK,
     TYPE_EVENT,
     TYPE_SESSION_SNAPSHOT,
+    _parse_ts,
     collect_by_type,
     to_click_doc,
     to_event_doc,
@@ -35,6 +40,7 @@ from pipeline.intent_sqs_contract import (
 )
 
 SESSION_VERSION_COLUMN = "source_updated_at"
+DEFAULT_SESSION_TIMEOUT_S = 1800
 
 
 def _upsert_sql(table: str, upsert_columns, update_columns) -> str:
@@ -109,14 +115,6 @@ def build_rows(messages: List[Dict[str, Any]]) -> Dict[str, List[tuple]]:
     return {"events": events, "clicks": clicks, "sessions": sessions}
 
 
-def _assert_version_column_exists(cursor) -> None:
-    cursor.execute("SHOW COLUMNS FROM intent_sessions LIKE %s", (SESSION_VERSION_COLUMN,))
-    if cursor.fetchone() is None:
-        raise RuntimeError(
-            "intent_sessions.source_updated_at is missing; apply the approved schema change first"
-        )
-
-
 def _execute_chunks(cursor, sql: str, rows: List[tuple]) -> None:
     # Deliberately NOT executemany_chunked: that helper commits at the end of every
     # call, which would split one brand batch into several commits.
@@ -124,20 +122,117 @@ def _execute_chunks(cursor, sql: str, rows: List[tuple]) -> None:
         cursor.executemany(sql, rows[start : start + EXECUTEMANY_CHUNK_SIZE])
 
 
+def _session_timeout_seconds() -> int:
+    raw = os.environ.get("SESSION_TIMEOUT", "").strip()
+    try:
+        return int(raw) if raw else DEFAULT_SESSION_TIMEOUT_S
+    except ValueError:
+        return DEFAULT_SESSION_TIMEOUT_S
+
+
+def _event_doc_with_identity(message: Dict[str, Any], session_id: str, actor_id: str) -> Dict[str, Any]:
+    doc = dict(message)
+    doc["session_id"] = session_id
+    doc["actor_id"] = actor_id
+    return doc
+
+
+def apply_messages(store, messages: List[Dict[str, Any]], timeout_s: int) -> Dict[str, int]:
+    """State-aware apply. Events and clicks are grouped by actor (actor_id || client_id)
+    and applied in occurred_at order. A message that is a duplicate, or an ATC already
+    claimed for its session, changes nothing: no row, no cursor move, no close."""
+    counts = {"events": 0, "clicks": 0, "sessions": 0, "duplicates": 0, "atc_deduped": 0, "closed": 0}
+
+    grouped = collect_by_type(messages)
+    snapshot_rows = []
+    for m in grouped[TYPE_SESSION_SNAPSHOT]:
+        row = _require_row(_extract_session_history_row(to_session_doc(m)), m["message_key"])
+        snapshot_rows.append(tuple(row))
+    if snapshot_rows:
+        store.upsert_session_rows(INTENT_SESSIONS_SQL, snapshot_rows)
+        counts["sessions"] += len(snapshot_rows)
+
+    stateful = sorted(
+        grouped[TYPE_EVENT] + grouped[TYPE_CLICK],
+        key=lambda m: (_parse_ts(m["occurred_at"], "occurred_at"), str(m["event_id"])),
+    )
+    by_actor: Dict[str, List[Dict[str, Any]]] = {}
+    one_off: List[Dict[str, Any]] = []
+    for m in stateful:
+        actor = m.get("actor_id") or m.get("client_id")
+        if actor:
+            by_actor.setdefault(actor, []).append(m)
+        else:
+            one_off.append(m)
+
+    for m in one_off:
+        session_id = str(uuid.uuid4())
+        _insert_message(store, m, session_id, "", counts)
+
+    # Deterministic global lock order: every consumer acquires actor row locks in
+    # the same sorted sequence, so two consumers can never hold locks in opposite
+    # orders (the classic deadlock). See lock_acquisition_order().
+    for actor in lock_acquisition_order(by_actor.keys()):
+        actor_messages = by_actor[actor]
+        cursor_state = store.get_cursor_for_update(actor)
+        changed = False
+        for m in actor_messages:
+            when = to_naive_utc(_parse_ts(m["occurred_at"], "occurred_at"))
+            next_state, closed, session_id = apply_event(cursor_state, m, when, timeout_s, actor)
+
+            pid = atc_product_id(m)
+            if pid is not None and not store.claim_atc(session_id, pid):
+                counts["atc_deduped"] += 1
+                continue
+
+            if not _insert_message(store, m, session_id, actor, counts):
+                continue
+
+            if closed is not None:
+                store.upsert_session_rows(INTENT_SESSIONS_SQL, [_closed_session_row(closed)])
+                counts["closed"] += 1
+                counts["sessions"] += 1
+            cursor_state = next_state
+            changed = True
+
+        if changed:
+            store.save_cursor(actor, cursor_state)
+
+    return counts
+
+
+def lock_acquisition_order(actor_keys) -> List[str]:
+    """Single source of truth for actor lock order: plain lexicographic sort of the
+    actor key (actor_id || client_id). Changing it would break mixed-version consumers."""
+    return sorted(actor_keys)
+
+
+def _insert_message(store, message: Dict[str, Any], session_id: str, actor: str, counts: Dict[str, int]) -> bool:
+    doc = _event_doc_with_identity(message, session_id, actor)
+    if message["type"] == TYPE_EVENT:
+        row = _require_row(_extract_behavioral_event_row(to_event_doc(doc)), message["message_key"])
+        kind, key = "event", "events"
+    else:
+        row = _require_row(_extract_click_event_row(to_click_doc(doc)), message["message_key"])
+        kind, key = "click", "clicks"
+    if store.insert_event(kind, row):
+        counts[key] += 1
+        return True
+    counts["duplicates"] += 1
+    return False
+
+
+def _closed_session_row(closed: Dict[str, Any]) -> tuple:
+    row = _require_row(_extract_session_history_row(closed), closed["session_id"])
+    return tuple(row)
+
+
 def apply_batch(cursor, connection, messages: List[Dict[str, Any]]) -> Dict[str, int]:
-    """Apply one brand's messages in a single transaction. Any exception leaves
-    the transaction uncommitted; the caller's get_db_cursor rolls it back."""
-    rows = build_rows(messages)
-    if rows["sessions"]:
-        _assert_version_column_exists(cursor)
-
-    _execute_chunks(cursor, BEHAVIORAL_EVENTS_SQL, rows["events"])
-    _execute_chunks(cursor, CLICK_EVENTS_SQL, rows["clicks"])
-    _execute_chunks(cursor, INTENT_SESSIONS_SQL, rows["sessions"])
+    """One brand's messages in a single transaction. Any exception leaves the
+    transaction uncommitted; the caller's get_db_cursor rolls it back, and the
+    worker keeps the messages un-deleted for SQS redelivery."""
+    verify_state_schema(cursor)
+    store = MySqlIntentStore(cursor)
+    counts = apply_messages(store, messages, _session_timeout_seconds())
     connection.commit()
-
-    return {
-        "events": len(rows["events"]),
-        "clicks": len(rows["clicks"]),
-        "sessions": len(rows["sessions"]),
-    }
+    return counts
