@@ -38,7 +38,6 @@ services:
     env_file:
       - .env
     environment:
-      INTENT_SQS_WRITE_MODE: dry_run
       AWS_REGION: ap-south-1
     restart: always
     networks:
