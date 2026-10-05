@@ -5,16 +5,6 @@ networks:
     external: true
 
 services:
-  intent-data-aggregation:
-    build: .
-    container_name: intent-data-aggregation
-    env_file:
-      - .env
-    restart: always
-    networks:
-      - pipeline-net
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
 
   intent-scoring-worker:
     build:
