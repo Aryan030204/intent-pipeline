@@ -207,6 +207,9 @@ class MySqlIntentStore:
     def unlock_all(self) -> None:
         while self._held_locks:
             self.cursor.execute("SELECT RELEASE_LOCK(%s)", (self._held_locks.pop(),))
+            # The connector keeps a SELECT result unread until it is fetched, and the next
+            # execute raises 'Unread result found'. Consume it before the next release.
+            self.cursor.fetchone()
 
     def begin_group(self):
         self._savepoint_seq += 1
