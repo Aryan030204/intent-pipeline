@@ -1,37 +1,74 @@
 """
 Storage for the SQS intent consumer. Two implementations share one interface:
 
-- MySqlIntentStore: production. Runs inside the caller's transaction, so nothing
-  is visible or acknowledged until the brand's batch commits.
-- InMemoryIntentStore: tests. Enforces the same unique keys, so duplicate and
-  deduplication behaviour is exercised without MySQL or AWS.
+- MySqlIntentStore: production. Runs inside the caller's transaction.
+- InMemoryIntentStore: tests. Enforces the same unique keys, savepoint rollback
+  and actor locking, so duplicate, dedupe and failure-isolation behaviour is
+  exercised without MySQL or AWS.
 
-Neither implementation reads or writes any document store.
+Concurrency: each actor is serialised by a server-side named lock (GET_LOCK)
+taken before the cursor row is read. This does not depend on InnoDB isolation
+level or gap-lock behaviour, so the first event of an actor is race-free under
+any isolation level. Actors are locked in sorted order, so named locks cannot
+form a cycle between workers. The row lock (SELECT ... FOR UPDATE) is kept.
 
 Schema is not created here. DDL lives in migrations/003_intent_sqs_state.sql and
 is applied explicitly per brand database. At runtime the consumer only verifies,
-read-only and once per database per process, that the tables exist.
+read-only and once per database per process, that tables, columns, unique keys
+and primary keys exist.
+
+This module never reads or writes a document store.
 """
 
+import copy
+import hashlib
 import json
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pipeline.intent_events import (
     _BEHAVIORAL_UPSERT_COLUMNS,
     _CLICK_EVENTS_UPSERT_COLUMNS,
+    _INTENT_SESSIONS_UPSERT_COLUMNS,
 )
 from pipeline.intent_session_state import to_naive_utc
 
 CURSOR_TABLE = "intent_actor_cursors"
 ATC_TABLE = "intent_atc_dedupe"
-REQUIRED_TABLES = (CURSOR_TABLE, ATC_TABLE)
 REQUIRED_SESSION_COLUMN = "source_updated_at"
+REQUIRED_SESSION_COLUMN_TYPE = "datetime(6)"
 MIGRATION_FILE = "migrations/003_intent_sqs_state.sql"
+
+CURSOR_COLUMNS = ("actor_id", "session_id", "session_start", "last_event_at", "last_event_id", "events_seq")
+ATC_COLUMNS = ("session_id", "product_id", "created_at")
+
+REQUIRED_PRIMARY_KEYS = {
+    CURSOR_TABLE: ("actor_id",),
+    ATC_TABLE: ("session_id", "product_id"),
+}
+REQUIRED_UNIQUE_KEYS = {
+    "behavioral_events": ("event_id",),
+    "click_events": ("event_id",),
+    "intent_sessions": ("session_id",),
+}
+REQUIRED_COLUMNS = {
+    "behavioral_events": tuple(_BEHAVIORAL_UPSERT_COLUMNS),
+    "click_events": tuple(_CLICK_EVENTS_UPSERT_COLUMNS),
+    "intent_sessions": tuple(_INTENT_SESSIONS_UPSERT_COLUMNS) + (REQUIRED_SESSION_COLUMN,),
+    CURSOR_TABLE: CURSOR_COLUMNS,
+    ATC_TABLE: ATC_COLUMNS,
+}
+
+ACTOR_LOCK_TIMEOUT_S = 30
+MAX_ACTOR_LOCK_NAME = 64
 
 _verified_databases: Set[str] = set()
 
 
 class SchemaMissing(RuntimeError):
+    pass
+
+
+class ActorLockTimeout(RuntimeError):
     pass
 
 
@@ -62,66 +99,76 @@ _CURSOR_UPSERT_SQL = (
 )
 
 
-REQUIRED_PRIMARY_KEYS = {
-    CURSOR_TABLE: ("actor_id",),
-    ATC_TABLE: ("session_id", "product_id"),
-}
-REQUIRED_SESSION_COLUMN_TYPE = "datetime(6)"
+def _cell(row, index: int, name: str):
+    return row.get(name) if isinstance(row, dict) else row[index]
 
 
 def verify_state_schema(cursor) -> None:
-    """Read-only. Raises SchemaMissing when a required table is absent, a required
-    primary key differs from the migration, or intent_sessions.source_updated_at is
-    missing or not DATETIME(6). Runs once per database per process; never issues DDL."""
+    """Read-only. Raises SchemaMissing with the first problem found: a missing table,
+    column, unique key or primary key, or a wrong source_updated_at type. Runs once
+    per database per process and never issues DDL."""
     cursor.execute("SELECT DATABASE() AS db")
     row = cursor.fetchone()
-    db = (row.get("db") if isinstance(row, dict) else row[0]) if row else None
+    db = _cell(row, 0, "db") if row else None
     if db in _verified_databases:
         return
 
-    cursor.execute(
-        "SELECT table_name AS name FROM information_schema.tables "
-        "WHERE table_schema = DATABASE() AND table_name IN (%s, %s)",
-        REQUIRED_TABLES,
-    )
-    present = {(r.get("name") if isinstance(r, dict) else r[0]) for r in cursor.fetchall()}
-    missing = [t for t in REQUIRED_TABLES if t not in present]
-    if missing:
-        raise SchemaMissing(f"missing tables {missing}; apply {MIGRATION_FILE} first")
+    tables = sorted(set(REQUIRED_COLUMNS) | set(REQUIRED_UNIQUE_KEYS))
+    placeholders = ", ".join(["%s"] * len(tables))
 
     cursor.execute(
-        "SELECT table_name AS tbl, column_name AS col FROM information_schema.statistics "
-        "WHERE table_schema = DATABASE() AND index_name = 'PRIMARY' AND table_name IN (%s, %s) "
-        "ORDER BY table_name, seq_in_index",
-        REQUIRED_TABLES,
+        f"SELECT table_name AS name FROM information_schema.tables "
+        f"WHERE table_schema = DATABASE() AND table_name IN ({placeholders})",
+        tables,
     )
-    actual_pk: Dict[str, List[str]] = {t: [] for t in REQUIRED_TABLES}
+    present = {_cell(r, 0, "name") for r in cursor.fetchall()}
+    for table in tables:
+        if table not in present:
+            raise SchemaMissing(f"missing table {table}; apply {MIGRATION_FILE} first")
+
+    cursor.execute(
+        f"SELECT table_name AS tbl, column_name AS col, column_type AS ctype "
+        f"FROM information_schema.columns WHERE table_schema = DATABASE() "
+        f"AND table_name IN ({placeholders})",
+        tables,
+    )
+    have_cols: Dict[str, Dict[str, str]] = {t: {} for t in tables}
     for r in cursor.fetchall():
-        tbl = r.get("tbl") if isinstance(r, dict) else r[0]
-        col = r.get("col") if isinstance(r, dict) else r[1]
-        actual_pk.setdefault(tbl, []).append(col)
-    for table, expected in REQUIRED_PRIMARY_KEYS.items():
-        if tuple(actual_pk.get(table, [])) != expected:
-            raise SchemaMissing(
-                f"{table} primary key is {tuple(actual_pk.get(table, []))}, expected {expected}; "
-                f"refusing to write (see {MIGRATION_FILE})"
-            )
+        have_cols[_cell(r, 0, "tbl")][_cell(r, 1, "col")] = str(_cell(r, 2, "ctype")).lower()
+    for table, columns in REQUIRED_COLUMNS.items():
+        for column in columns:
+            if column not in have_cols[table]:
+                raise SchemaMissing(f"{table}.{column} is missing; apply {MIGRATION_FILE} first")
+    actual_type = have_cols["intent_sessions"][REQUIRED_SESSION_COLUMN]
+    if actual_type != REQUIRED_SESSION_COLUMN_TYPE:
+        raise SchemaMissing(
+            f"intent_sessions.{REQUIRED_SESSION_COLUMN} is {actual_type}, expected {REQUIRED_SESSION_COLUMN_TYPE}"
+        )
 
     cursor.execute(
-        "SELECT column_type AS ctype FROM information_schema.columns "
-        "WHERE table_schema = DATABASE() AND table_name = 'intent_sessions' AND column_name = %s",
-        (REQUIRED_SESSION_COLUMN,),
+        f"SELECT table_name AS tbl, index_name AS idx, non_unique AS nu, column_name AS col "
+        f"FROM information_schema.statistics WHERE table_schema = DATABASE() "
+        f"AND table_name IN ({placeholders}) ORDER BY table_name, index_name, seq_in_index",
+        tables,
     )
-    rows = cursor.fetchall()
-    if not rows:
-        raise SchemaMissing(
-            f"intent_sessions.{REQUIRED_SESSION_COLUMN} is missing; apply {MIGRATION_FILE} first"
+    index_cols: Dict[Tuple[str, str], List[str]] = {}
+    index_unique: Dict[Tuple[str, str], bool] = {}
+    for r in cursor.fetchall():
+        key = (_cell(r, 0, "tbl"), _cell(r, 1, "idx"))
+        index_cols.setdefault(key, []).append(_cell(r, 3, "col"))
+        index_unique[key] = int(_cell(r, 2, "nu")) == 0
+
+    for table, expected in REQUIRED_PRIMARY_KEYS.items():
+        actual = tuple(index_cols.get((table, "PRIMARY"), []))
+        if actual != expected:
+            raise SchemaMissing(f"{table} primary key is {actual}, expected {expected}; refusing to write")
+    for table, expected in REQUIRED_UNIQUE_KEYS.items():
+        found = any(
+            index_unique.get(k) and tuple(v) == expected
+            for k, v in index_cols.items() if k[0] == table
         )
-    ctype = rows[0].get("ctype") if isinstance(rows[0], dict) else rows[0][0]
-    if str(ctype).lower() != REQUIRED_SESSION_COLUMN_TYPE:
-        raise SchemaMissing(
-            f"intent_sessions.{REQUIRED_SESSION_COLUMN} is {ctype}, expected {REQUIRED_SESSION_COLUMN_TYPE}"
-        )
+        if not found:
+            raise SchemaMissing(f"{table} has no unique key on {expected}; refusing to write")
 
     _verified_databases.add(db)
 
@@ -131,15 +178,51 @@ def reset_schema_verification() -> None:
     _verified_databases.clear()
 
 
+def _lock_name(db: str, actor: str) -> str:
+    digest = hashlib.sha256(f"{db}|{actor}".encode("utf-8")).hexdigest()
+    return ("ia:" + digest)[:MAX_ACTOR_LOCK_NAME]
+
+
 class MySqlIntentStore:
     def __init__(self, cursor) -> None:
         self.cursor = cursor
+        self._db: Optional[str] = None
+        self._held_locks: List[str] = []
+        self._savepoint_seq = 0
+
+    def _database(self) -> str:
+        if self._db is None:
+            self.cursor.execute("SELECT DATABASE() AS db")
+            row = self.cursor.fetchone()
+            self._db = _cell(row, 0, "db") or ""
+        return self._db
+
+    def lock_actor(self, actor_id: str) -> None:
+        name = _lock_name(self._database(), actor_id)
+        self.cursor.execute("SELECT GET_LOCK(%s, %s) AS got", (name, ACTOR_LOCK_TIMEOUT_S))
+        if _cell(self.cursor.fetchone(), 0, "got") != 1:
+            raise ActorLockTimeout(f"could not acquire actor lock within {ACTOR_LOCK_TIMEOUT_S}s")
+        self._held_locks.append(name)
+
+    def unlock_all(self) -> None:
+        while self._held_locks:
+            self.cursor.execute("SELECT RELEASE_LOCK(%s)", (self._held_locks.pop(),))
+
+    def begin_group(self):
+        self._savepoint_seq += 1
+        name = f"sp_{self._savepoint_seq}"
+        self.cursor.execute(f"SAVEPOINT {name}")
+        return name
+
+    def commit_group(self, token) -> None:
+        self.cursor.execute(f"RELEASE SAVEPOINT {token}")
+
+    def rollback_group(self, token) -> None:
+        self.cursor.execute(f"ROLLBACK TO SAVEPOINT {token}")
 
     def get_cursor_for_update(self, actor_id: str) -> Optional[Dict[str, Any]]:
-        # FOR UPDATE serialises two consumers working on the same actor.
         self.cursor.execute(
-            f"SELECT actor_id, session_id, session_start, last_event_at, last_event_id, events_seq "
-            f"FROM {CURSOR_TABLE} WHERE actor_id = %s FOR UPDATE",
+            f"SELECT {', '.join(CURSOR_COLUMNS)} FROM {CURSOR_TABLE} WHERE actor_id = %s FOR UPDATE",
             (actor_id,),
         )
         row = self.cursor.fetchone()
@@ -148,8 +231,7 @@ class MySqlIntentStore:
         if isinstance(row, dict):
             get = row.get
         else:
-            names = ("actor_id", "session_id", "session_start", "last_event_at", "last_event_id", "events_seq")
-            get = dict(zip(names, row)).get
+            get = dict(zip(CURSOR_COLUMNS, row)).get
         seq = get("events_seq")
         return {
             "actor_id": get("actor_id"),
@@ -188,8 +270,7 @@ class MySqlIntentStore:
 
 
 class InMemoryIntentStore:
-    """Mirrors the MySQL unique keys: event_id per table, (session_id, product_id)
-    for ATC, actor_id for cursors."""
+    """Mirrors the MySQL unique keys, savepoint rollback and actor locking."""
 
     def __init__(self) -> None:
         self.events: Dict[str, tuple] = {}
@@ -198,9 +279,39 @@ class InMemoryIntentStore:
         self.cursors: Dict[str, Dict[str, Any]] = {}
         self.sessions: List[tuple] = []
         self.locked_actors: List[str] = []
+        self.fail_on_actor: Set[str] = set()
+
+    def lock_actor(self, actor_id: str) -> None:
+        self.locked_actors.append(actor_id)
+
+    def unlock_all(self) -> None:
+        pass
+
+    def _snapshot(self):
+        return {
+            "events": copy.deepcopy(self.events),
+            "clicks": copy.deepcopy(self.clicks),
+            "atc": set(self.atc),
+            "cursors": copy.deepcopy(self.cursors),
+            "sessions": list(self.sessions),
+        }
+
+    def begin_group(self):
+        return self._snapshot()
+
+    def commit_group(self, token) -> None:
+        pass
+
+    def rollback_group(self, token) -> None:
+        self.events = token["events"]
+        self.clicks = token["clicks"]
+        self.atc = token["atc"]
+        self.cursors = token["cursors"]
+        self.sessions = token["sessions"]
 
     def get_cursor_for_update(self, actor_id: str) -> Optional[Dict[str, Any]]:
-        self.locked_actors.append(actor_id)
+        if actor_id in self.fail_on_actor:
+            raise RuntimeError(f"injected failure for actor {actor_id}")
         stored = self.cursors.get(actor_id)
         return None if stored is None else _copy_cursor(stored)
 

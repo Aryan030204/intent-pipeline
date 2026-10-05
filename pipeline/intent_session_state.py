@@ -1,11 +1,29 @@
 """
 Pure session/state logic for the SQS intent consumer. Mirrors the old producer
-state machine (alerts-service services/intent/sessionState.js): same timeout,
-same 30 s negative tolerance, same rollover/closing arithmetic, same
-contiguous events_seq. No database handles here, so every rule is unit-testable.
+state machine (alerts-service services/intent/sessionState.js) for every ordered
+case, and adds a deterministic policy for SQS standard reordering:
 
-Times are naive UTC datetimes internally. MySQL returns naive values, and the
-rules compare instants, so one representation avoids tz-aware/naive mixing.
+- Timeout, close and events_seq semantics are unchanged.
+- An event up to 30 s before the actor's last event stays in the session and
+  never moves last_event_at backwards (old behaviour).
+- An event that is late but still inside the current session's span
+  (session_start <= when < last_event_at - 30 s) stays in the session. The old
+  code split the session here solely because SQS delivered the event late.
+- An event before the current session's start belongs to an earlier, already
+  closed session. It cannot be reattached without rewriting committed rows, so
+  it is stored as an orphan with its own session id and changes no cursor and
+  closes nothing.
+
+Times are naive UTC datetimes internally (see Timestamps below).
+
+Timestamps: the producer (alerts-service services/intent/sqsProducer.js) already
+converts occurred_at to the brand's store-local wall clock
+(services/intent/timezone.js toStoreLocalOccurredAt) and encodes that wall clock
+with a trailing Z. The worker stores the parsed wall clock unchanged. Converting
+again here would shift every event by the brand's offset. Consequence: for zones
+with DST, the producer's display value does not carry the true instant, so gap
+arithmetic is off by the DST shift at the two transitions a year. Brands in
+fixed-offset zones (e.g. Asia/Kolkata) are unaffected.
 """
 
 import uuid
@@ -16,6 +34,8 @@ NEGATIVE_TOLERANCE = timedelta(seconds=30)
 
 NEW_SESSION = "new_session"
 CONTINUE = "continue"
+CONTINUE_LATE = "continue_late"
+ORPHAN = "orphan"
 
 
 def to_naive_utc(value: Optional[datetime]) -> Optional[datetime]:
@@ -27,20 +47,20 @@ def to_naive_utc(value: Optional[datetime]) -> Optional[datetime]:
 
 
 def decide_timing(cursor: Optional[Dict[str, Any]], when: datetime, timeout_s: int) -> str:
-    """Same predicate as sessionState.js:35-39. A missing cursor, a gap above the
-    timeout, or an event more than 30 s before the last event starts a new session."""
     if cursor is None:
         return NEW_SESSION
-    gap = when - cursor["last_event_at"]
-    if gap > timedelta(seconds=timeout_s) or gap < -NEGATIVE_TOLERANCE:
+    last = cursor["last_event_at"]
+    start = cursor["session_start"]
+    if when > last + timedelta(seconds=timeout_s):
         return NEW_SESSION
-    return CONTINUE
+    if when < start - NEGATIVE_TOLERANCE:
+        return ORPHAN
+    if when >= last - NEGATIVE_TOLERANCE:
+        return CONTINUE
+    return CONTINUE_LATE
 
 
 def close_session_row(cursor: Dict[str, Any], actor_id: str) -> Dict[str, Any]:
-    """Session document in the shape _extract_session_history_row reads.
-    session_end = last event time; session_time_spent = last event - session start,
-    in ms. The timeout gap is excluded, as in sessionState.js:73-122."""
     last = cursor["last_event_at"]
     start = cursor["session_start"]
     spent_ms = int((last - start).total_seconds() * 1000)
@@ -74,9 +94,13 @@ def apply_event(
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], str]:
     """Returns (next_cursor, closed_previous_session_or_None, session_id).
 
-    Does not mutate `cursor`, so a caller can discard the result when the event
-    turns out to be a duplicate or a deduped ATC."""
+    Does not mutate `cursor`. For ORPHAN the returned cursor is the input cursor
+    unchanged and the session id is a fresh UUID that no cursor refers to."""
     decision = decide_timing(cursor, when, timeout_s)
+
+    if decision == ORPHAN:
+        return dict(cursor), None, str(uuid.uuid4())
+
     if decision == NEW_SESSION:
         closed = close_session_row(cursor, actor_id) if cursor else None
         session_id = str(uuid.uuid4())
@@ -102,8 +126,7 @@ def apply_event(
 
 def normalize_shopify_product_id(raw_id: str) -> str:
     """Same rule as alerts-service normalize.js normalizeShopifyId: a GID such as
-    gid://shopify/Product/9 becomes "Product:9"; anything else is returned as-is.
-    The producer already normalizes, so this is an idempotent guard."""
+    gid://shopify/Product/9 becomes "Product:9"; anything else is returned as-is."""
     if "/" in raw_id:
         parts = raw_id.split("/")
         return f"{parts[-2]}:{parts[-1]}"
@@ -111,9 +134,8 @@ def normalize_shopify_product_id(raw_id: str) -> str:
 
 
 def atc_product_id(message: Dict[str, Any]) -> Optional[str]:
-    """Product id used for ATC dedupe, matching the old Mongo path (ingest.js
-    productId = resolveProductId). SYNTH: and FALLBACK: ids never dedupe, because
-    the old path synthesized a per-event id for them."""
+    """Product id used for ATC dedupe, matching the old Mongo path. SYNTH: and
+    FALLBACK: ids never dedupe."""
     if message.get("event_name") != "product_added_to_cart":
         return None
     raw = message.get("raw") or {}

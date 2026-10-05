@@ -1,19 +1,31 @@
+import itertools
 import json
 import pathlib
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from pipeline.intent_session_state import (
     CONTINUE,
+    CONTINUE_LATE,
     NEW_SESSION,
+    ORPHAN,
     apply_event,
     atc_product_id,
     decide_timing,
 )
-from pipeline.intent_sqs_contract import parse_message
-from pipeline.intent_sqs_store import InMemoryIntentStore, MySqlIntentStore
-from pipeline.intent_sqs_writer import apply_messages
+from pipeline.intent_sqs_contract import MalformedMessage, parse_message
+from pipeline.intent_sqs_store import (
+    InMemoryIntentStore,
+    MySqlIntentStore,
+    SchemaMissing,
+    reset_schema_verification,
+    verify_state_schema,
+)
+from pipeline.intent_sqs_writer import apply_batch, apply_messages
+from tests.fake_db import FakeConnection, FakeDbCursor, FatalDbError, SchemaState
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -21,23 +33,24 @@ TIMEOUT = 1800
 BASE = datetime(2026, 10, 4, 6, 0, 0)
 
 
-def at(seconds: float) -> str:
-    return (BASE + timedelta(seconds=seconds)).replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+def at(seconds: float, base: datetime = BASE) -> str:
+    return (base + timedelta(seconds=seconds)).replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def event(event_id, when, actor="actor-1", name="page_viewed", raw=None, client=None, click=False, bucket=None):
+def event(event_id, when, actor="actor-1", name="page_viewed", raw=None, client=None, click=False,
+          bucket=None, base=BASE, brand="bbb_shop"):
     msg = {
         "schema_version": 1,
         "type": "click" if click else "event",
         "message_key": event_id,
-        "brand_id": "bbb_shop",
+        "brand_id": brand,
         "event_id": event_id,
         "event_name": "click" if click else name,
         "actor_id": actor,
         "client_id": client,
         "visitor_id": "visitor-x",
         "session_id": None,
-        "occurred_at": at(when),
+        "occurred_at": at(when, base),
         "url": "https://shop.example/products/item",
         "referrer": None,
         "user_agent": "Mozilla/5.0 test",
@@ -61,134 +74,170 @@ def run(store, msgs, timeout=TIMEOUT):
     return apply_messages(store, parse(msgs), timeout)
 
 
-def closed_session_rows(store):
-    return store.sessions
+def cur(last, start=None, actor="a"):
+    start = start or last
+    return {
+        "actor_id": actor, "session_id": "s-1", "session_start": start, "last_event_at": last,
+        "last_event_id": "e-last", "events_seq": {"1": {"event_name": "page_viewed", "event_id": "e-last"}},
+    }
 
 
-def session_row_field(row, index):
-    return row[index]
+# ---- pure timing rules ----
 
-
-# ---- pure rules ----
-
-def test_decide_timing_no_cursor_is_new_session():
+def test_no_cursor_is_new_session():
     assert decide_timing(None, datetime(2026, 1, 1), TIMEOUT) == NEW_SESSION
 
 
-def test_decide_timing_within_timeout_continues():
-    cur = {"last_event_at": datetime(2026, 1, 1, 0, 0, 0)}
-    assert decide_timing(cur, datetime(2026, 1, 1, 0, 29, 0), TIMEOUT) == CONTINUE
+def test_gap_equal_to_timeout_continues_and_above_starts_new():
+    last = datetime(2026, 1, 1, 0, 0)
+    assert decide_timing(cur(last), last + timedelta(seconds=TIMEOUT), TIMEOUT) == CONTINUE
+    assert decide_timing(cur(last), last + timedelta(seconds=TIMEOUT, microseconds=1), TIMEOUT) == NEW_SESSION
 
 
-def test_decide_timing_gap_above_timeout_starts_new_session():
-    cur = {"last_event_at": datetime(2026, 1, 1, 0, 0, 0)}
-    assert decide_timing(cur, datetime(2026, 1, 1, 0, 30, 1), TIMEOUT) == NEW_SESSION
+def test_event_within_30s_before_last_continues_without_moving_last_back():
+    last = datetime(2026, 1, 1, 0, 10)
+    nxt, closed, sid = apply_event(cur(last, datetime(2026, 1, 1)),
+                                   {"event_id": "e2", "event_name": "page_viewed"},
+                                   datetime(2026, 1, 1, 0, 9, 45), TIMEOUT, "a")
+    assert closed is None and sid == "s-1"
+    assert nxt["last_event_at"] == last
 
 
-def test_decide_timing_out_of_order_within_tolerance_continues_and_keeps_last():
-    cur = {
-        "actor_id": "a", "session_id": "s", "session_start": datetime(2026, 1, 1),
-        "last_event_at": datetime(2026, 1, 1, 0, 10), "last_event_id": "e1",
-        "events_seq": {"1": {"event_name": "page_viewed", "event_id": "e1"}},
-    }
-    msg = {"event_id": "e2", "event_name": "page_viewed"}
-    nxt, closed, sid = apply_event(cur, msg, datetime(2026, 1, 1, 0, 9, 45), TIMEOUT, "a")
-    assert closed is None and sid == "s"
-    assert nxt["last_event_at"] == datetime(2026, 1, 1, 0, 10)
+def test_event_late_by_more_than_30s_but_inside_session_is_continue_late():
+    cursor = cur(datetime(2026, 1, 1, 0, 10), datetime(2026, 1, 1, 0, 0))
+    assert decide_timing(cursor, datetime(2026, 1, 1, 0, 5), TIMEOUT) == CONTINUE_LATE
 
 
-def test_decide_timing_more_than_30s_before_last_event_starts_new_session():
-    cur = {"last_event_at": datetime(2026, 1, 1, 0, 10)}
-    assert decide_timing(cur, datetime(2026, 1, 1, 0, 9, 29), TIMEOUT) == NEW_SESSION
+def test_late_event_inside_session_appends_without_split_or_moving_last_back():
+    last = datetime(2026, 1, 1, 0, 10)
+    cursor = cur(last, datetime(2026, 1, 1, 0, 0))
+    nxt, closed, sid = apply_event(cursor, {"event_id": "late", "event_name": "page_viewed"},
+                                   datetime(2026, 1, 1, 0, 5), TIMEOUT, "a")
+    assert closed is None and sid == "s-1"
+    assert nxt["last_event_at"] == last
+    assert list(nxt["events_seq"].keys()) == ["1", "2"]
 
 
-def test_atc_product_id_rejects_synthetic_and_missing_ids():
-    assert atc_product_id({"event_name": "product_added_to_cart", "raw": {"product_id": "123"}}) == "123"
-    assert atc_product_id({"event_name": "product_added_to_cart", "raw": {"product_id": "SYNTH:x"}}) is None
-    assert atc_product_id({"event_name": "product_added_to_cart", "raw": {"product_id": "FALLBACK:x"}}) is None
-    assert atc_product_id({"event_name": "product_added_to_cart", "raw": {}}) is None
-    assert atc_product_id({"event_name": "page_viewed", "raw": {"product_id": "123"}}) is None
+def test_event_from_before_session_start_is_orphan_and_changes_nothing():
+    cursor = cur(datetime(2026, 1, 1, 0, 10), datetime(2026, 1, 1, 0, 0))
+    nxt, closed, sid = apply_event(cursor, {"event_id": "old", "event_name": "page_viewed"},
+                                   datetime(2025, 12, 31, 23, 59), TIMEOUT, "a")
+    assert decide_timing(cursor, datetime(2025, 12, 31, 23, 59), TIMEOUT) == ORPHAN
+    assert closed is None
+    assert nxt == cursor
+    assert sid != "s-1"
 
 
-# ---- flows through the in-memory store (duplicates, rollover, ATC) ----
+# ---- ordering policy (SQS standard reordering) ----
 
-def test_direct_event_message_is_consumed_and_gets_a_derived_session_id():  # 1, 3
+def test_ordered_A_B_C_is_one_session_with_last_C():
     store = InMemoryIntentStore()
-    counts = run(store, [event("e-1", 0)])
-    assert counts["events"] == 1
-    row = store.events["e-1"]
-    assert row[5] is not None and len(row[5]) == 36  # session_id is a uuid, not null
-    assert store.cursors["actor-1"]["session_id"] == row[5]
+    run(store, [event("A", 0), event("B", 60), event("C", 120)])
+    assert store.cursors["actor-1"]["last_event_id"] == "C"
+    assert [v["event_id"] for v in store.cursors["actor-1"]["events_seq"].values()] == ["A", "B", "C"]
+    assert store.sessions == []
 
 
-def test_direct_click_message_is_consumed(): # 2
+def test_A_C_B_stays_one_session_last_stays_C():
     store = InMemoryIntentStore()
-    counts = run(store, [event("c-1", 0, click=True)])
-    assert counts["clicks"] == 1
-    assert "c-1" in store.clicks
+    run(store, [event("A", 0)])
+    run(store, [event("C", 120)])
+    run(store, [event("B", 60)])
+    sid = store.cursors["actor-1"]["session_id"]
+    assert store.cursors["actor-1"]["last_event_id"] == "C"
+    assert [v["event_id"] for v in store.cursors["actor-1"]["events_seq"].values()] == ["A", "C", "B"]
+    assert store.sessions == []
+    assert all(store.events[e][5] == sid for e in ("A", "B", "C"))
 
 
-def test_existing_session_continues_and_events_seq_is_contiguous(): # 5, 9
+def test_late_by_under_30s_does_not_split():
     store = InMemoryIntentStore()
-    run(store, [event("e-1", 0), event("e-2", 60), event("e-3", 120, name="product_viewed", raw={"product_id": "9"})])
-    seq = store.cursors["actor-1"]["events_seq"]
-    assert list(seq.keys()) == ["1", "2", "3"]
-    assert seq["3"]["event_name"] == "product_viewed"
-    assert store.sessions == []  # open session is not written to intent_sessions
+    run(store, [event("A", 100)])
+    run(store, [event("B", 80)])
+    assert store.sessions == []
+    assert store.events["B"][5] == store.events["A"][5]
 
 
-def test_rollover_closes_previous_session_with_end_and_duration(): # 6, 7, 8
+def test_late_by_over_30s_inside_session_does_not_split():
+    store = InMemoryIntentStore()
+    run(store, [event("A", 0)])
+    run(store, [event("C", 300)])
+    run(store, [event("B", 100)])
+    assert store.sessions == []
+    assert store.events["B"][5] == store.events["A"][5]
+
+
+def test_event_from_previous_session_arriving_late_is_orphan():
+    store = InMemoryIntentStore()
+    run(store, [event("A", 0), event("B", 60)])
+    run(store, [event("D", TIMEOUT + 500)])
+    current = store.cursors["actor-1"]["session_id"]
+    closed_before = len(store.sessions)
+    run(store, [event("OLD", 10)])
+    assert len(store.sessions) == closed_before
+    assert store.cursors["actor-1"]["session_id"] == current
+    assert store.events["OLD"][5] != current
+
+
+def test_arrival_order_does_not_change_final_state():
+    batch = [event("A", 0), event("B", 40), event("C", 90), event("D", 200)]
+    first, second = InMemoryIntentStore(), InMemoryIntentStore()
+    run(first, batch)
+    run(second, list(reversed(batch)))
+    assert first.cursors["actor-1"]["events_seq"] == second.cursors["actor-1"]["events_seq"]
+    assert first.cursors["actor-1"]["last_event_id"] == second.cursors["actor-1"]["last_event_id"] == "D"
+
+
+# ---- flows: rollover, duplicates, ATC, actorless ----
+
+def test_rollover_closes_previous_session_with_end_and_duration():
     store = InMemoryIntentStore()
     run(store, [event("e-1", 0), event("e-2", 100)])
-    first_session = store.cursors["actor-1"]["session_id"]
-    run(store, [event("e-3", 100 + TIMEOUT + 10)])  # gap > timeout
-
-    assert store.cursors["actor-1"]["session_id"] != first_session
-    assert len(store.sessions) == 1
+    first = store.cursors["actor-1"]["session_id"]
+    run(store, [event("e-3", 100 + TIMEOUT + 10)])
+    assert store.cursors["actor-1"]["session_id"] != first
     closed = store.sessions[0]
-    assert closed[0] == first_session
-    assert closed[5] == (BASE + timedelta(seconds=100)).replace(tzinfo=timezone.utc)  # session_end
-    assert closed[6] == 100_000  # session_time_spent_ms = 100 s, timeout gap excluded
+    assert closed[0] == first
+    assert closed[5] == (BASE + timedelta(seconds=100)).replace(tzinfo=timezone.utc)
+    assert closed[6] == 100_000
 
 
-def test_events_seq_resets_for_new_session_and_closed_session_keeps_old_sequence(): # 9
+def test_events_seq_resets_per_session_and_closed_sequence_is_kept():
     store = InMemoryIntentStore()
     run(store, [event("e-1", 0), event("e-2", 10)])
     run(store, [event("e-3", 10 + TIMEOUT + 5)])
     assert list(store.cursors["actor-1"]["events_seq"].keys()) == ["1"]
-    closed_seq = json.loads(store.sessions[0][16])
-    assert list(closed_seq.keys()) == ["1", "2"]
+    assert list(json.loads(store.sessions[0][16]).keys()) == ["1", "2"]
 
 
-def test_atc_is_deduped_per_session_on_the_consumer(): # 10
+def test_atc_is_deduped_per_session_and_does_not_move_cursor():
     store = InMemoryIntentStore()
     atc = lambda eid, when: event(eid, when, name="product_added_to_cart", raw={"product_id": "555"})
     counts = run(store, [atc("a-1", 0), atc("a-2", 30)])
     assert "a-1" in store.events and "a-2" not in store.events
     assert counts["atc_deduped"] == 1
-    assert store.cursors["actor-1"]["events_seq"].keys() == {"1"}  # deduped ATC did not move the cursor
+    assert list(store.cursors["actor-1"]["events_seq"].keys()) == ["1"]
 
 
-def test_atc_same_product_in_new_session_is_recorded_again(): # per-session dedupe semantics
+def test_atc_same_product_in_new_session_is_recorded_again():
     store = InMemoryIntentStore()
     atc = lambda eid, when: event(eid, when, name="product_added_to_cart", raw={"product_id": "555"})
     run(store, [atc("a-1", 0), atc("a-2", TIMEOUT + 60)])
     assert "a-1" in store.events and "a-2" in store.events
 
 
-def test_duplicate_sqs_delivery_of_event_creates_no_second_row_or_session(): # 11
+def test_duplicate_event_delivery_does_not_mutate_state():
     store = InMemoryIntentStore()
     msgs = [event("e-1", 0), event("e-2", 20)]
     run(store, msgs)
-    before_cursor = dict(store.cursors["actor-1"])
-    counts = run(store, msgs)  # redelivery
+    before = store.cursors["actor-1"]
+    counts = run(store, msgs)
     assert counts["events"] == 0 and counts["duplicates"] == 2
     assert len(store.events) == 2
-    assert store.cursors["actor-1"]["session_id"] == before_cursor["session_id"]
-    assert store.cursors["actor-1"]["events_seq"] == before_cursor["events_seq"]
+    assert store.cursors["actor-1"] == before
 
 
-def test_duplicate_click_delivery_creates_no_second_click_row(): # 12
+def test_duplicate_click_delivery_creates_no_second_click_row():
     store = InMemoryIntentStore()
     run(store, [event("c-1", 0, click=True)])
     counts = run(store, [event("c-1", 0, click=True)])
@@ -196,7 +245,7 @@ def test_duplicate_click_delivery_creates_no_second_click_row(): # 12
     assert len(store.clicks) == 1
 
 
-def test_duplicate_delivery_after_rollover_does_not_close_session_twice(): # 11 (rollover case)
+def test_duplicate_after_rollover_does_not_close_twice():
     store = InMemoryIntentStore()
     run(store, [event("e-1", 0)])
     late = [event("e-2", TIMEOUT + 10)]
@@ -205,280 +254,168 @@ def test_duplicate_delivery_after_rollover_does_not_close_session_twice(): # 11 
     assert len(store.sessions) == 1
 
 
-def test_actorless_events_are_one_off_sessions_without_cursor_or_close():
+def test_actorless_events_are_one_off_sessions_without_cursor():
     store = InMemoryIntentStore()
-    run(store, [event("x-1", 0, actor=None, client=None), event("x-2", 5, actor=None, client=None)])
-    assert len(store.events) == 2
-    assert store.cursors == {}
-    assert store.sessions == []
-    sids = {store.events[k][5] for k in ("x-1", "x-2")}
-    assert len(sids) == 2  # each one-off event gets its own session id
+    run(store, [event("x-1", 0, actor=None), event("x-2", 5, actor=None)])
+    assert len(store.events) == 2 and store.cursors == {} and store.sessions == []
+    assert len({store.events[k][5] for k in ("x-1", "x-2")}) == 2
 
 
-def test_client_id_is_used_when_actor_id_missing():
+def test_client_id_is_used_when_actor_id_is_missing():
     store = InMemoryIntentStore()
     run(store, [event("e-1", 0, actor=None, client="client-9")])
     assert "client-9" in store.cursors
-    assert store.events["e-1"][2] == "client-9"  # actor_id column carries the actor key
+    assert store.events["e-1"][2] == "client-9"
 
 
-def test_visitor_id_is_never_the_actor_identity():
+def test_visitor_id_is_never_identity():
     store = InMemoryIntentStore()
-    run(store, [event("e-1", 0, actor=None, client=None)])
+    run(store, [event("e-1", 0, actor=None)])
     assert "visitor-x" not in store.cursors
 
 
-def test_messages_are_applied_in_occurred_at_order_within_a_batch():
+def test_messages_applied_in_occurred_at_order_within_batch():
     store = InMemoryIntentStore()
     run(store, [event("e-late", 50), event("e-early", 0)])
     seq = store.cursors["actor-1"]["events_seq"]
-    assert seq["1"]["event_id"] == "e-early"
-    assert seq["2"]["event_id"] == "e-late"
+    assert seq["1"]["event_id"] == "e-early" and seq["2"]["event_id"] == "e-late"
 
 
-# ---- contract compatibility and no Mongo / outbox dependency ----
+# ---- actor locking and deterministic lock order ----
 
-def test_existing_v1_fixtures_still_parse(): # 17
+def test_actor_lock_order_is_sorted_regardless_of_batch_order():
+    actors = ["delta", "alpha", "charlie", "bravo"]
+    for perm in itertools.permutations(actors):
+        store = InMemoryIntentStore()
+        run(store, [event(f"e-{a}", i * 10, actor=a) for i, a in enumerate(perm)])
+        assert store.locked_actors == sorted(actors), perm
+
+
+def test_two_consumers_with_opposite_batch_orders_lock_in_same_sequence():
+    a, b = InMemoryIntentStore(), InMemoryIntentStore()
+    run(a, [event("z", 0, actor="zed"), event("m", 10, actor="mike"), event("a", 20, actor="amy")])
+    run(b, [event("a", 20, actor="amy"), event("m", 10, actor="mike"), event("z", 0, actor="zed")])
+    assert a.locked_actors == b.locked_actors == ["amy", "mike", "zed"]
+
+
+def test_mysql_store_takes_named_lock_before_row_lock():
+    cur_ = FakeDbCursor()
+    store = MySqlIntentStore(cur_)
+    store.lock_actor("a")
+    assert store.get_cursor_for_update("a") is None
+    get_lock = next(i for i, s in enumerate(cur_.sql) if "GET_LOCK" in s)
+    row_lock = next(i for i, s in enumerate(cur_.sql) if "FOR UPDATE" in s)
+    assert get_lock < row_lock
+    store.unlock_all()
+    assert any("RELEASE_LOCK" in s for s in cur_.sql)
+
+
+# ---- poison isolation ----
+
+class _FailingInsertStore(InMemoryIntentStore):
+    def __init__(self, bad_event_id, exc):
+        super().__init__()
+        self.bad_event_id = bad_event_id
+        self.exc = exc
+
+    def insert_event(self, kind, row):
+        if row[0] == self.bad_event_id:
+            raise self.exc
+        return super().insert_event(kind, row)
+
+
+class DataTooLong(Exception):
+    errno = 1406
+
+
+def test_poison_message_in_actor_group_rolls_back_alone_and_neighbours_commit():
+    store = _FailingInsertStore("m2", DataTooLong("data too long"))
+    counts = run(store, [event("m1", 0), event("m2", 30), event("m3", 60)])
+    assert "m1" in store.events and "m3" in store.events and "m2" not in store.events
+    assert [m["event_id"] for m in counts["failed_messages"]] == ["m2"]
+
+
+def test_poison_actor_does_not_block_healthy_actor():
+    store = InMemoryIntentStore()
+    store.fail_on_actor.add("bad")
+    counts = run(store, [event("g1", 0, actor="good"), event("b1", 0, actor="bad"),
+                         event("g2", 30, actor="good")])
+    assert "g1" in store.events and "g2" in store.events and "b1" not in store.events
+    assert [m["event_id"] for m in counts["failed_messages"]] == ["b1"]
+
+
+def test_fatal_mysql_error_is_not_isolated():
+    store = _FailingInsertStore("m1", FatalDbError("connection lost"))
+    with pytest.raises(FatalDbError):
+        run(store, [event("m1", 0)])
+
+
+# ---- contract: timestamps, timezone ----
+
+def _body(**overrides):
+    base = {
+        "schema_version": 1, "type": "event", "message_key": "k", "brand_id": "bbb_shop",
+        "event_id": "e", "event_name": "page_viewed", "actor_id": "a",
+        "occurred_at": "2026-10-04T00:30:00.000Z",
+    }
+    base.update(overrides)
+    return json.dumps(base)
+
+
+def test_store_local_wall_clock_is_stored_unchanged():
+    msg = parse_message(_body(occurred_at="2026-10-04T00:30:00.000Z"))
+    store = InMemoryIntentStore()
+    apply_messages(store, [msg], TIMEOUT)
+    assert store.events["e"][-1] == datetime(2026, 10, 4, 0, 30, tzinfo=timezone.utc)
+
+
+def test_microseconds_are_preserved():
+    msg = parse_message(_body(occurred_at="2026-10-04T00:30:00.123456Z"))
+    store = InMemoryIntentStore()
+    apply_messages(store, [msg], TIMEOUT)
+    assert store.events["e"][-1].microsecond == 123456
+
+
+def test_explicit_offset_is_rejected_to_avoid_double_conversion():
+    with pytest.raises(MalformedMessage):
+        parse_message(_body(occurred_at="2026-10-04T00:30:00.000+05:30"))
+
+
+def test_session_rollover_at_midnight_keeps_store_local_business_date():
+    store = InMemoryIntentStore()
+    run(store, [event("e-1", 0, base=datetime(2026, 10, 3, 23, 50)),
+                event("e-2", 0, base=datetime(2026, 10, 4, 0, 1))], timeout=60)
+    closed = store.sessions[0]
+    assert closed[4].date().isoformat() == "2026-10-03"
+
+
+def test_two_brands_with_different_zones_pass_the_same_wall_clock_through():
+    a, b = InMemoryIntentStore(), InMemoryIntentStore()
+    run(a, [event("e-1", 0, base=datetime(2026, 10, 4, 0, 30))])
+    run(b, [event("e-1", 0, base=datetime(2026, 10, 4, 0, 30), brand="pts_shop")])
+    assert a.events["e-1"][-1] == b.events["e-1"][-1] == datetime(2026, 10, 4, 0, 30, tzinfo=timezone.utc)
+
+
+def test_existing_v1_fixtures_still_parse():
     for name in ("event_v1.json", "click_v1.json", "session_snapshot_v1.json"):
         parse_message(json.dumps(json.loads((FIXTURES / name).read_text(encoding="utf-8"))))
 
 
-def test_mysql_store_locks_the_cursor_row_for_update(): # 13/14 support
-    class Cur:
-        def __init__(self):
-            self.sql = []
+# ---- ATC product id ----
 
-        def execute(self, sql, params=None):
-            self.sql.append(sql)
-
-        def fetchone(self):
-            return None
-
-    cur = Cur()
-    assert MySqlIntentStore(cur).get_cursor_for_update("a") is None
-    assert "FOR UPDATE" in cur.sql[-1]
+@pytest.mark.parametrize("raw_product_id, expected", [
+    ("gid://shopify/Product/9", "Product:9"),
+    ("Product:9", "Product:9"),
+    ("9000000000001", "9000000000001"),
+    ("SYNTH:abcdef0123456789", None),
+    ("FALLBACK:x", None),
+    ("", None),
+])
+def test_atc_product_id_matches_old_producer_semantics(raw_product_id, expected):
+    assert atc_product_id({"event_name": "product_added_to_cart", "raw": {"product_id": raw_product_id}}) == expected
 
 
-def test_state_modules_do_not_reference_mongo_or_outbox(): # 15, 16
-    for rel in (
-        "pipeline/intent_session_state.py",
-        "pipeline/intent_sqs_store.py",
-        "pipeline/intent_sqs_writer.py",
-        "workers/intent_sqs_worker.py",
-    ):
-        source = (ROOT / rel).read_text(encoding="utf-8")
-        for banned in (
-            "pymongo", "MongoClient", "intent_outbox",
-            "intent_sessions.events", "intent_sessions.click_events", "intent_sessions.actor_cursors",
-            "intent_sessions.session_history", "intent_sessions.intent_outbox", "slug_cache", "SlugCache",
-        ):
-            assert banned not in source, f"{rel} references {banned}"
-
-
-class SchemaOkCursor:
-    """Answers the read-only schema checks as if the migration had been applied.
-    Overrides let a test describe a specific wrong schema."""
-    rowcount = 0
-    pk_rows = [("intent_actor_cursors", "actor_id"), ("intent_atc_dedupe", "session_id"), ("intent_atc_dedupe", "product_id")]
-    source_type = [("datetime(6)",)]
-    tables = [("intent_actor_cursors",), ("intent_atc_dedupe",)]
-
-    def __init__(self):
-        self.sql = []
-        self._last = ""
-
-    def execute(self, sql, params=None):
-        self.sql.append(sql)
-        self._last = sql
-
-    def fetchone(self):
-        return ("testdb",) if "SELECT DATABASE()" in self._last else None
-
-    def fetchall(self):
-        if "information_schema.tables" in self._last:
-            return list(self.tables)
-        if "information_schema.statistics" in self._last:
-            return list(self.pk_rows)
-        if "information_schema.columns" in self._last:
-            return list(self.source_type)
-        return []
-
-    def executemany(self, sql, rows):
-        pass
-
-
-def test_failed_transaction_propagates_so_the_worker_keeps_the_message(): # 13
-    from pipeline.intent_sqs_store import reset_schema_verification
-    from pipeline.intent_sqs_writer import apply_batch
-
-    reset_schema_verification()
-
-    class Boom(SchemaOkCursor):
-        def execute(self, sql, params=None):
-            if "INSERT INTO behavioral_events" in sql:
-                raise RuntimeError("mysql down")
-            super().execute(sql, params)
-
-    class Conn:
-        commits = 0
-
-        def commit(self):
-            Conn.commits += 1
-
-    with pytest.raises(RuntimeError):
-        apply_batch(Boom(), Conn(), parse([event("e-1", 0)]))
-    assert Conn.commits == 0
-
-
-# ---- correction 2: no per-batch DDL; schema verified once per database ----
-
-def test_apply_batch_issues_no_ddl(): # correction 2
-    from pipeline.intent_sqs_store import reset_schema_verification
-    from pipeline.intent_sqs_writer import apply_batch
-
-    reset_schema_verification()
-    cur = SchemaOkCursor()
-
-    class Conn:
-        def commit(self):
-            pass
-
-    apply_batch(cur, Conn(), parse([event("e-1", 0), event("c-1", 5, click=True)]))
-    apply_batch(cur, Conn(), parse([event("e-2", 10)]))
-    ddl = [q for q in cur.sql if "CREATE TABLE" in q.upper() or "ALTER TABLE" in q.upper()]
-    assert ddl == []
-
-
-def test_schema_is_verified_once_per_database_not_per_batch(): # correction 2
-    from pipeline.intent_sqs_store import reset_schema_verification
-    from pipeline.intent_sqs_writer import apply_batch
-
-    reset_schema_verification()
-    cur = SchemaOkCursor()
-
-    class Conn:
-        def commit(self):
-            pass
-
-    apply_batch(cur, Conn(), parse([event("e-1", 0)]))
-    checks_after_first = sum("information_schema" in q for q in cur.sql)
-    apply_batch(cur, Conn(), parse([event("e-2", 10)]))
-    apply_batch(cur, Conn(), parse([event("e-3", 20)]))
-    checks_after_all = sum("information_schema" in q for q in cur.sql)
-    assert checks_after_first == 3  # tables, primary keys, column type: read-only, once
-    assert checks_after_all == checks_after_first
-
-
-def test_missing_migration_refuses_to_write(): # correction 2
-    from pipeline.intent_sqs_store import SchemaMissing, reset_schema_verification
-    from pipeline.intent_sqs_writer import apply_batch
-
-    reset_schema_verification()
-
-    class NoTables(SchemaOkCursor):
-        def fetchall(self):
-            if "information_schema.tables" in self._last:
-                return [("intent_actor_cursors",)]  # intent_atc_dedupe absent
-            return super().fetchall()
-
-    cur = NoTables()
-
-    class Conn:
-        commits = 0
-
-        def commit(self):
-            Conn.commits += 1
-
-    with pytest.raises(SchemaMissing):
-        apply_batch(cur, Conn(), parse([event("e-1", 0)]))
-    assert not any("INSERT" in q for q in cur.sql)
-    assert Conn.commits == 0
-
-
-# ---- correction 1: deterministic actor lock order ----
-
-def _multi_actor_messages(order):
-    return [event(f"e-{a}", i * 10, actor=a) for i, a in enumerate(order)]
-
-
-def test_actor_lock_order_is_sorted_regardless_of_batch_order(): # correction 1
-    import itertools
-
-    actors = ["delta", "alpha", "charlie", "bravo"]
-    for perm in itertools.permutations(actors):
-        store = InMemoryIntentStore()
-        apply_messages(store, parse(_multi_actor_messages(perm)), TIMEOUT)
-        assert store.locked_actors == sorted(actors), perm
-
-
-def test_two_consumers_with_opposite_batch_orders_lock_in_the_same_sequence(): # correction 1
-    a_first = InMemoryIntentStore()
-    b_first = InMemoryIntentStore()
-    apply_messages(a_first, parse(_multi_actor_messages(["zed", "mike", "amy"])), TIMEOUT)
-    apply_messages(b_first, parse(_multi_actor_messages(["amy", "mike", "zed"])), TIMEOUT)
-    assert a_first.locked_actors == b_first.locked_actors == ["amy", "mike", "zed"]
-
-
-def test_threaded_consumers_with_overlapping_actors_do_not_deadlock(): # correction 1
-    import threading
-
-    shared_locks = {a: threading.Lock() for a in ["amy", "mike", "zed"]}
-
-    class HoldingStore(InMemoryIntentStore):
-        def __init__(self):
-            super().__init__()
-            self.held = []
-
-        def get_cursor_for_update(self, actor_id):
-            shared_locks[actor_id].acquire(timeout=5)
-            self.held.append(actor_id)
-            return super().get_cursor_for_update(actor_id)
-
-        def release(self):
-            for a in reversed(self.held):
-                shared_locks[a].release()
-
-    done = []
-
-    def consume(order, label):
-        store = HoldingStore()
-        try:
-            apply_messages(store, parse(_multi_actor_messages(order)), TIMEOUT)
-            done.append(label)
-        finally:
-            store.release()
-
-    t1 = threading.Thread(target=consume, args=(["zed", "amy", "mike"], "one"))
-    t2 = threading.Thread(target=consume, args=(["mike", "zed", "amy"], "two"))
-    t1.start()
-    t2.start()
-    t1.join(10)
-    t2.join(10)
-    assert not t1.is_alive() and not t2.is_alive(), "consumers deadlocked"
-    assert sorted(done) == ["one", "two"]
-
-
-# ---- correction 3: ATC product-id semantics ----
-
-@pytest.mark.parametrize(
-    "raw_product_id, expected",
-    [
-        ("gid://shopify/Product/9", "Product:9"),   # producer normalizeShopifyId output for a GID
-        ("Product:9", "Product:9"),                 # already normalized: idempotent
-        ("9000000000001", "9000000000001"),          # plain numeric id stays as-is
-        ("SYNTH:abcdef0123456789", None),            # synthesized: never dedupes (old rule)
-        ("FALLBACK:x", None),                        # fallback: never dedupes (old rule)
-        ("", None),
-    ],
-)
-def test_atc_product_id_matches_old_producer_semantics(raw_product_id, expected): # correction 3
-    from pipeline.intent_session_state import atc_product_id
-
-    msg = {"event_name": "product_added_to_cart", "raw": {"product_id": raw_product_id}}
-    assert atc_product_id(msg) == expected
-
-
-def test_gid_and_normalized_atc_are_deduped_as_the_same_product(): # correction 3 regression
+def test_gid_and_normalized_atc_dedupe_as_same_product():
     store = InMemoryIntentStore()
     run(store, [
         event("a-1", 0, name="product_added_to_cart", raw={"product_id": "gid://shopify/Product/9"}),
@@ -487,57 +424,111 @@ def test_gid_and_normalized_atc_are_deduped_as_the_same_product(): # correction 
     assert "a-1" in store.events and "a-2" not in store.events
 
 
-# ---- verifier: correct / missing / incorrect primary key / wrong type ----
+# ---- schema verification (read-only, once per database) ----
 
-def _verify_with(cursor_cls):
-    from pipeline.intent_sqs_store import reset_schema_verification, verify_state_schema
-
+def _verify(state):
     reset_schema_verification()
-    verify_state_schema(cursor_cls())
+    verify_state_schema(FakeDbCursor(state))
 
 
-def test_verifier_passes_on_correct_schema(): # verifier: correct schema
-    _verify_with(SchemaOkCursor)
+def test_verifier_passes_on_correct_schema():
+    _verify(SchemaState())
 
 
-def test_verifier_fails_on_missing_table(): # verifier: missing table
-    from pipeline.intent_sqs_store import SchemaMissing
-
-    class Missing(SchemaOkCursor):
-        tables = [("intent_actor_cursors",)]
-
+def test_verifier_fails_on_missing_table():
     with pytest.raises(SchemaMissing, match="intent_atc_dedupe"):
-        _verify_with(Missing)
+        _verify(SchemaState(missing_tables=("intent_atc_dedupe",)))
 
 
-def test_verifier_fails_on_incorrect_atc_primary_key(): # verifier: incorrect PK
-    from pipeline.intent_sqs_store import SchemaMissing
+def test_verifier_fails_on_missing_column_used_by_inserts():
+    with pytest.raises(SchemaMissing, match="behavioral_events.event_name"):
+        _verify(SchemaState(missing_columns=("behavioral_events.event_name",)))
 
-    class BadAtcKey(SchemaOkCursor):
-        pk_rows = [("intent_actor_cursors", "actor_id"), ("intent_atc_dedupe", "session_id")]
 
+def test_verifier_fails_on_missing_unique_key_needed_for_dedupe():
+    with pytest.raises(SchemaMissing, match="behavioral_events has no unique key"):
+        _verify(SchemaState(missing_unique=("behavioral_events",)))
+
+
+def test_verifier_fails_on_incorrect_atc_primary_key():
     with pytest.raises(SchemaMissing, match="intent_atc_dedupe primary key"):
-        _verify_with(BadAtcKey)
+        _verify(SchemaState(pk_override={"intent_atc_dedupe": ("session_id",)}))
 
 
-def test_verifier_fails_on_incorrect_cursor_primary_key(): # verifier: incorrect PK
-    from pipeline.intent_sqs_store import SchemaMissing
-
-    class BadCursorKey(SchemaOkCursor):
-        pk_rows = [
-            ("intent_actor_cursors", "actor_id"), ("intent_actor_cursors", "session_id"),
-            ("intent_atc_dedupe", "session_id"), ("intent_atc_dedupe", "product_id"),
-        ]
-
+def test_verifier_fails_on_incorrect_cursor_primary_key():
     with pytest.raises(SchemaMissing, match="intent_actor_cursors primary key"):
-        _verify_with(BadCursorKey)
+        _verify(SchemaState(pk_override={"intent_actor_cursors": ("actor_id", "session_id")}))
 
 
-def test_verifier_fails_on_wrong_source_updated_at_type(): # verifier: wrong type
-    from pipeline.intent_sqs_store import SchemaMissing
-
-    class WrongType(SchemaOkCursor):
-        source_type = [("datetime",)]
-
+def test_verifier_fails_on_wrong_source_updated_at_type():
     with pytest.raises(SchemaMissing, match=r"expected datetime\(6\)"):
-        _verify_with(WrongType)
+        _verify(SchemaState(source_type="datetime"))
+
+
+def test_schema_is_verified_once_per_database_not_per_batch():
+    reset_schema_verification()
+    cur_ = FakeDbCursor()
+    conn = FakeConnection()
+    apply_batch(cur_, conn, parse([event("e-1", 0)]))
+    first = sum("information_schema" in q for q in cur_.sql)
+    apply_batch(cur_, conn, parse([event("e-2", 10)]))
+    apply_batch(cur_, conn, parse([event("e-3", 20)]))
+    assert first > 0
+    assert sum("information_schema" in q for q in cur_.sql) == first
+
+
+def test_apply_batch_issues_no_ddl():
+    reset_schema_verification()
+    cur_ = FakeDbCursor()
+    apply_batch(cur_, FakeConnection(), parse([event("e-1", 0), event("c-1", 5, click=True)]))
+    assert not [q for q in cur_.sql if "CREATE TABLE" in q.upper() or "ALTER TABLE" in q.upper()]
+
+
+def test_missing_migration_writes_nothing():
+    reset_schema_verification()
+    cur_ = FakeDbCursor(SchemaState(missing_tables=("intent_atc_dedupe",)))
+    conn = FakeConnection()
+    with pytest.raises(SchemaMissing):
+        apply_batch(cur_, conn, parse([event("e-1", 0)]))
+    assert not any(q.lstrip().upper().startswith("INSERT") for q in cur_.sql)
+    assert conn.commits == 0
+
+
+def test_outage_aborts_batch_without_commit():
+    reset_schema_verification()
+    store = _FailingInsertStore("e-1", FatalDbError("mysql down"))
+    with pytest.raises(FatalDbError):
+        run(store, [event("e-1", 0)])
+
+
+# ---- static guarantees ----
+
+def test_state_modules_do_not_reference_mongo_or_outbox():
+    banned = ("pymongo", "MongoClient", "intent_outbox", "intent_sessions.events",
+              "intent_sessions.click_events", "intent_sessions.actor_cursors",
+              "intent_sessions.session_history", "intent_sessions.intent_outbox", "slug_cache", "SlugCache")
+    for rel in ("pipeline/intent_session_state.py", "pipeline/intent_sqs_store.py",
+                "pipeline/intent_sqs_writer.py", "workers/intent_sqs_worker.py"):
+        source = (ROOT / rel).read_text(encoding="utf-8")
+        for term in banned:
+            assert term not in source, f"{rel} references {term}"
+
+
+def test_worker_import_path_does_not_load_pymongo():
+    code = ("import sys, pipeline.intent_sqs_writer, workers.intent_sqs_worker\n"
+            "print('PYMONGO=' + str('pymongo' in sys.modules))")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=str(ROOT))
+    assert "PYMONGO=False" in out.stdout, out.stdout + out.stderr
+
+
+# ---- ID length caps (VARCHAR(100)) ----
+
+@pytest.mark.parametrize("field", ["event_id", "actor_id", "client_id"])
+def test_id_of_100_chars_is_accepted(field):
+    parse_message(_body(**{field: "x" * 100}))
+
+
+@pytest.mark.parametrize("field", ["event_id", "actor_id", "client_id"])
+def test_id_of_101_chars_is_rejected(field):
+    with pytest.raises(MalformedMessage):
+        parse_message(_body(**{field: "x" * 101}))

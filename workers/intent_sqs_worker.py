@@ -48,6 +48,49 @@ class ProcessResult:
     malformed: List[str] = field(default_factory=list)
 
 
+class VisibilityHeartbeat:
+    """Extends visibility for receipt handles still being processed. Starts only
+    after one interval, so a batch that finishes quickly makes no extra API calls.
+    Stopped before any delete, so it never touches a message it is about to delete."""
+
+    def __init__(self, sqs, queue_url: str, timeout_s: int, interval_s: Optional[float] = None) -> None:
+        self.sqs = sqs
+        self.queue_url = queue_url
+        self.timeout_s = int(timeout_s)
+        self.interval_s = interval_s if interval_s is not None else max(1.0, timeout_s / 3)
+        self._handles: List[str] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def track(self, handles: List[str]) -> None:
+        with self._lock:
+            self._handles = list(handles)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="intent-sqs-heartbeat", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            with self._lock:
+                handles = list(self._handles)
+            for handle in handles:
+                try:
+                    self.sqs.change_message_visibility(
+                        QueueUrl=self.queue_url, ReceiptHandle=handle, VisibilityTimeout=self.timeout_s
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"[intent-sqs] category=visibility_heartbeat_failed reason={type(exc).__name__}: {exc}"
+                    )
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
 class IntentSqsWorker:
     def __init__(
         self,
@@ -62,6 +105,7 @@ class IntentSqsWorker:
         transaction_factory: Optional[Callable[[int], Any]] = None,
         apply_fn: Optional[Callable[..., Dict[str, int]]] = None,
         clock: Callable[[], float] = time.monotonic,
+        heartbeat_interval_s: Optional[float] = None,
     ) -> None:
         if write_mode not in WRITE_MODES:
             raise ValueError(f"unknown write mode {write_mode!r}")
@@ -77,6 +121,7 @@ class IntentSqsWorker:
         self.transaction_factory = transaction_factory
         self.apply_fn = apply_fn
         self.clock = clock
+        self.heartbeat_interval_s = heartbeat_interval_s
 
     def receive(self) -> List[Dict[str, Any]]:
         response = self.sqs.receive_message(
@@ -114,26 +159,45 @@ class IntentSqsWorker:
                 logger.info(f"[intent-sqs] dry-run brand={brand} messages={len(items)} types={kinds} (no writes, no deletes)")
             result.retained.extend(raw.get("MessageId", "") for raw in raw_messages if raw.get("MessageId") not in result.malformed)
         else:
-            for brand, items in by_brand.items():
-                brand_index = self.brand_resolver(brand)
-                if brand_index is None:
-                    result.retained.extend(raw.get("MessageId", "") for raw, _ in items)
-                    logger.warning(f"[intent-sqs] brand_id={brand} is not mapped in INTENT_DB_MAP; left for redelivery")
-                    continue
-                try:
-                    with self.transaction_factory(brand_index) as (cursor, connection):
-                        counts = self.apply_fn(cursor, connection, [msg for _, msg in items])
-                except Exception as exc:
-                    result.retained.extend(raw.get("MessageId", "") for raw, _ in items)
-                    logger.error(
-                        f"[intent-sqs] brand={brand} transaction rolled back, messages left for redelivery: "
-                        f"{type(exc).__name__}: {exc}"
+            heartbeat = VisibilityHeartbeat(
+                self.sqs, self.queue_url, self.visibility_timeout_seconds, self.heartbeat_interval_s
+            )
+            heartbeat.track([raw.get("ReceiptHandle", "") for raw in raw_messages])
+            heartbeat.start()
+            try:
+                for brand, items in by_brand.items():
+                    brand_index = self.brand_resolver(brand)
+                    if brand_index is None:
+                        result.retained.extend(raw.get("MessageId", "") for raw, _ in items)
+                        logger.warning(
+                            f"[intent-sqs] category=unknown_brand brand_id={brand} "
+                            f"messages={len(items)} left for redelivery (not in INTENT_DB_MAP)"
+                        )
+                        continue
+                    try:
+                        with self.transaction_factory(brand_index) as (cursor, connection):
+                            counts = self.apply_fn(cursor, connection, [msg for _, msg in items])
+                    except Exception as exc:
+                        result.retained.extend(raw.get("MessageId", "") for raw, _ in items)
+                        logger.error(
+                            f"[intent-sqs] category=mysql_transaction_failed brand={brand} "
+                            f"messages={len(items)} left for redelivery: {type(exc).__name__}: {exc}"
+                        )
+                        continue
+                    failed_ids = {id(m) for m in counts.pop("failed_messages", [])}
+                    for raw, msg in items:
+                        if id(msg) in failed_ids:
+                            result.retained.append(raw.get("MessageId", ""))
+                        else:
+                            result.committed.append(
+                                {"MessageId": raw.get("MessageId", ""), "ReceiptHandle": raw["ReceiptHandle"]}
+                            )
+                    logger.info(
+                        f"[intent-sqs] category=committed brand={brand} committed={len(items) - len(failed_ids & {id(m) for _, m in items})} "
+                        f"retained={len(failed_ids & {id(m) for _, m in items})} counts={counts}"
                     )
-                    continue
-                logger.info(f"[intent-sqs] committed brand={brand} counts={counts}")
-                result.committed.extend(
-                    {"MessageId": raw.get("MessageId", ""), "ReceiptHandle": raw["ReceiptHandle"]} for raw, _ in items
-                )
+            finally:
+                heartbeat.stop()
 
         self._delete_committed(result.committed)
 

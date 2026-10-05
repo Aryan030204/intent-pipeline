@@ -35,10 +35,22 @@ def _parse_ts(value: Any, field: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _require_store_local_ts(value: Any, field: str) -> None:
+    """The producer sends the store-local wall clock encoded with a trailing Z. Any other
+    explicit offset means the value was not produced by /track, and converting it here
+    would shift the event by the offset, so it is rejected."""
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise MalformedMessage(f"{field} must be a store-local wall clock ending in Z")
+    _parse_ts(value, field)
+
+
 def _optional_ts(value: Any, field: str):
     if value is None:
         return None
     return _parse_ts(value, field)
+
+
+MAX_ID_LENGTH = 100  # VARCHAR(100) on every table these IDs are written to
 
 
 def _require_str(message: Dict[str, Any], field: str) -> str:
@@ -46,6 +58,19 @@ def _require_str(message: Dict[str, Any], field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise MalformedMessage(f"{field} required")
     return value
+
+
+def _require_id(message: Dict[str, Any], field: str) -> str:
+    value = _require_str(message, field)
+    if len(value) > MAX_ID_LENGTH:
+        raise MalformedMessage(f"{field} exceeds {MAX_ID_LENGTH} characters")
+    return value
+
+
+def _optional_id(message: Dict[str, Any], field: str) -> None:
+    value = message.get(field)
+    if value is not None and (not isinstance(value, str) or len(value) > MAX_ID_LENGTH):
+        raise MalformedMessage(f"{field} must be a string of at most {MAX_ID_LENGTH} characters")
 
 
 def parse_message(body: str) -> Dict[str, Any]:
@@ -67,17 +92,19 @@ def parse_message(body: str) -> Dict[str, Any]:
     _require_str(message, "brand_id")
     _require_str(message, "message_key")
 
+    _optional_id(message, "actor_id")
+    _optional_id(message, "client_id")
     if msg_type in (TYPE_EVENT, TYPE_CLICK):
-        _require_str(message, "event_id")
+        _require_id(message, "event_id")
         _require_str(message, "event_name")
-        _parse_ts(message.get("occurred_at"), "occurred_at")
+        _require_store_local_ts(message.get("occurred_at"), "occurred_at")
         if msg_type == TYPE_CLICK:
             bucket = message.get("click_bucket")
             if bucket is not None and bucket not in _VALID_CLICK_BUCKETS:
                 raise MalformedMessage(f"invalid click_bucket {bucket!r}")
     else:
-        _require_str(message, "session_id")
-        _require_str(message, "actor_id")
+        _require_id(message, "session_id")
+        _require_id(message, "actor_id")
         _parse_ts(message.get("session_start"), "session_start")
         _parse_ts(message.get("source_updated_at"), "source_updated_at")
         if not isinstance(message.get("events_seq"), dict):
