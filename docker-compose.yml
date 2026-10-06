@@ -28,3 +28,23 @@ services:
       - pipeline-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  # Kafka -> MySQL intent consumer. Reaches Kafka as kafka-service:9092 over pipeline-net
+  # (the kafka-service stack lives in the dashboard repo's compose file, so depends_on cannot
+  # reference it; the worker exits if the topics are missing and restart: always retries).
+  intent-kafka-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.intent-scoring-worker
+    container_name: intent-kafka-worker
+    command: ["python", "workers/intent_kafka_worker.py"]
+    env_file:
+      - .env
+    restart: always
+    # SIGTERM lets the current batch finish (MySQL COMMIT, then offset commit) before exit.
+    stop_grace_period: 60s
+    mem_limit: 512m
+    networks:
+      - pipeline-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -1,11 +1,14 @@
 """
 Per-brand orchestration for the Intent Data Aggregation pipeline: resolves
-which of this pipeline's active brands each Mongo brand_id in INTENT_DB_MAP
-maps to, runs the three intent syncs (behavioral events, click events,
-session history) for that brand, the top-level job runner invoked by
-APScheduler and manual triggers (run_data_pipeline), and the Flask routes
-(/trigger, /health) - same shape as the reference orders-pipeline
+which of this pipeline's active brands each brand_id in INTENT_DB_MAP maps
+to, runs the analytical rollups for that brand, the top-level job runner
+invoked by APScheduler and manual triggers (run_data_pipeline), and the
+Flask routes (/trigger, /health) - same shape as the reference orders-pipeline
 architecture (pipeline/orchestration.py + aws_background.py facade).
+
+Ingestion is NOT done here any more. Intent events reach MySQL through the Kafka
+consumer (workers/intent_kafka_worker.py); this job only reads the committed MySQL
+tables. It no longer reads MongoDB.
 """
 
 import os
@@ -29,12 +32,7 @@ from pipeline.state import (
     _last_logs_handler,
 )
 from pipeline.db import get_db_cursor, log_db_connection_metrics
-from pipeline.intent_events import (
-    _parse_intent_db_map,
-    sync_intent_events_for_brand,
-    sync_click_events_for_brand,
-    sync_session_history_for_brand,
-)
+from pipeline.intent_events import _parse_intent_db_map
 from pipeline.rollups import run_rollups_for_brand
 
 # aws_background still owns the brand_config_init category (PIPELINE_AUTH_HEADER/
@@ -72,69 +70,17 @@ def _process_mapped_brand(
     brand_index = _resolve_brand_index_by_db_database(db_database_value)
     if brand_index is None:
         logger.warning(
-            "Skipping intent events for mongo_brand_id=%s: db_database=%s does not "
+            "Skipping rollups for brand_id=%s: db_database=%s does not "
             "match any active brand's DB_DATABASE_<i>",
             mongo_brand_id,
             db_database_value,
         )
         return
 
-    logger.info(f"\n{'=' * 50}\nSTARTING INTENT SYNC FOR: {db_database_value}\n{'=' * 50}")
+    logger.info(f"\n{'=' * 50}\nSTARTING INTENT ROLLUPS FOR:{db_database_value}\n{'=' * 50}")
     log_db_connection_metrics(f"DB_CONNECTION_METRICS_BRAND_START brand={db_database_value}")
 
-    logger.info(f"Starting behavioral events ingestion for brand={db_database_value}")
-    try:
-        sync_intent_events_for_brand(
-            brand_index=brand_index,
-            mongo_brand_id=mongo_brand_id,
-            brand_label=db_database_value,
-        )
-    except Exception as e:
-        logger.error(
-            "Error running intent events sync for mongo_brand_id=%s db_database=%s: %s",
-            mongo_brand_id,
-            db_database_value,
-            e,
-        )
-
-    # Independent try/except: a failure ingesting click events must not
-    # block behavioral-event ingestion for this brand, or vice versa.
-    logger.info(f"Starting click events ingestion for brand={db_database_value}")
-    try:
-        sync_click_events_for_brand(
-            brand_index=brand_index,
-            mongo_brand_id=mongo_brand_id,
-            brand_label=db_database_value,
-        )
-    except Exception as e:
-        logger.error(
-            "Error running click events sync for mongo_brand_id=%s db_database=%s: %s",
-            mongo_brand_id,
-            db_database_value,
-            e,
-        )
-
-    # Independent try/except: a failure ingesting session history must not
-    # block either of the other two syncs, or vice versa.
-    logger.info(f"Starting session history ingestion for brand={db_database_value}")
-    try:
-        sync_session_history_for_brand(
-            brand_index=brand_index,
-            mongo_brand_id=mongo_brand_id,
-            brand_label=db_database_value,
-        )
-    except Exception as e:
-        logger.error(
-            "Error running session history sync for mongo_brand_id=%s db_database=%s: %s",
-            mongo_brand_id,
-            db_database_value,
-            e,
-        )
-
-    # Independent try/except: rollup failures must not affect the ingestion
-    # syncs' own reported success/failure above, and ingestion failures
-    # above must not prevent rollups from running against whatever raw
-    # data is already committed.
+    # The rollups read whatever the Kafka consumer has already committed to MySQL.
     logger.info(f"Starting analytical rollups for brand={db_database_value}")
     try:
         run_rollups_for_brand(
@@ -143,13 +89,13 @@ def _process_mapped_brand(
         )
     except Exception as e:
         logger.error(
-            "Error running analytical rollups for mongo_brand_id=%s db_database=%s: %s",
+            "Error running analytical rollups for brand_id=%s db_database=%s: %s",
             mongo_brand_id,
             db_database_value,
             e,
         )
 
-    logger.info(f"✅ COMPLETED INTENT SYNC FOR {db_database_value}")
+    logger.info(f"✅ COMPLETED INTENT ROLLUPS FOR {db_database_value}")
     log_db_connection_metrics(f"DB_CONNECTION_METRICS_BRAND_COMPLETE brand={db_database_value}")
     _db_context.job_id = None
 

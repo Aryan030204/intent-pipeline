@@ -1,4 +1,9 @@
 """
+LEGACY NOTE: the Mongo -> MySQL sync functions in this module (sync_*_for_brand) are no
+longer called by the pipeline. Intent events now arrive from Kafka (see
+pipeline/intent_kafka_consumer.py). This module still owns the MySQL table DDL helpers,
+column tuples and the pure row extractors that the Kafka consumer reuses.
+
 Intent behavioral events ingestion: reads tracking events (product_viewed,
 etc.) from the Intent MongoDB cluster (INTENT_MONGO_URI, intent_sessions.events
 - distinct from any order-pipeline Mongo cluster) and ingests them into each
@@ -17,8 +22,6 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
-
-from pymongo import MongoClient
 
 from pipeline.state import IST, logger
 from pipeline.db import (
@@ -107,6 +110,8 @@ def _resolve_intent_events_collection():
     if not mongo_uri:
         raise ValueError("INTENT_MONGO_URI is not configured")
 
+    from pymongo import MongoClient  # lazy: only the legacy Mongo sync needs a Mongo client
+
     client = MongoClient(mongo_uri, tz_aware=True)
     return client, client["intent_sessions"]["events"]
 
@@ -116,6 +121,8 @@ def _resolve_intent_click_events_collection():
     if not mongo_uri:
         raise ValueError("INTENT_MONGO_URI is not configured")
 
+    from pymongo import MongoClient  # lazy: only the legacy Mongo sync needs a Mongo client
+
     client = MongoClient(mongo_uri, tz_aware=True)
     return client, client["intent_sessions"]["click_events"]
 
@@ -124,6 +131,8 @@ def _resolve_intent_session_history_collection():
     mongo_uri = os.environ.get("INTENT_MONGO_URI")
     if not mongo_uri:
         raise ValueError("INTENT_MONGO_URI is not configured")
+
+    from pymongo import MongoClient  # lazy: only the legacy Mongo sync needs a Mongo client
 
     client = MongoClient(mongo_uri, tz_aware=True)
     return client, client["intent_sessions"]["session_history"]

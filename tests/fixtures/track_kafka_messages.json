@@ -1,0 +1,379 @@
+{
+  "page_viewed": {
+    "topic": "intent.other",
+    "key": "bbb_shop:cid-1",
+    "value": {
+      "schema_version": 1,
+      "type": "event",
+      "message_key": "sh-AAAA-0001",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-AAAA-0001",
+      "event_name": "page_viewed",
+      "actor_id": "cid-1",
+      "client_id": "cid-1",
+      "visitor_id": "vis-1",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "raw": {}
+    }
+  },
+  "product_viewed": {
+    "topic": "intent.other",
+    "key": "bbb_shop:cid-1",
+    "value": {
+      "schema_version": 1,
+      "type": "event",
+      "message_key": "sh-PV-1",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-PV-1",
+      "event_name": "product_viewed",
+      "actor_id": "cid-1",
+      "client_id": "cid-1",
+      "visitor_id": "vis-1",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "raw": {
+        "product_id": "gid://shopify/Product/42",
+        "variant_id": "gid://shopify/ProductVariant/7",
+        "product_title": "T",
+        "price": 12.5,
+        "currency": "INR"
+      }
+    }
+  },
+  "checkout_started": {
+    "topic": "intent.checkout",
+    "key": "bbb_shop:cid-1",
+    "value": {
+      "schema_version": 1,
+      "type": "event",
+      "message_key": "sh-CO-1",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-CO-1",
+      "event_name": "checkout_started",
+      "actor_id": "cid-1",
+      "client_id": "cid-1",
+      "visitor_id": "vis-1",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "raw": {
+        "checkout_total": 999.5,
+        "currency": "INR"
+      }
+    }
+  },
+  "product_added_to_cart": {
+    "topic": "intent.atc",
+    "key": "bbb_shop:cid-1",
+    "value": {
+      "schema_version": 1,
+      "type": "event",
+      "message_key": "sh-ATC-1",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-ATC-1",
+      "event_name": "product_added_to_cart",
+      "actor_id": "cid-1",
+      "client_id": "cid-1",
+      "visitor_id": "vis-1",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "raw": {
+        "product_id": "Product:42",
+        "quantity": 2,
+        "price": 10
+      }
+    }
+  },
+  "add_to_cart_alias": {
+    "topic": "intent.atc",
+    "key": "bbb_shop:cid-1",
+    "value": {
+      "schema_version": 1,
+      "type": "event",
+      "message_key": "sh-ATC-2",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-ATC-2",
+      "event_name": "add_to_cart",
+      "actor_id": "cid-1",
+      "client_id": "cid-1",
+      "visitor_id": "vis-1",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "raw": {
+        "product_id": "Product:42",
+        "quantity": 1
+      }
+    }
+  },
+  "atc_synth": {
+    "topic": "intent.atc",
+    "key": "bbb_shop:cid-1",
+    "value": {
+      "schema_version": 1,
+      "type": "event",
+      "message_key": "sh-ATC-3",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-ATC-3",
+      "event_name": "product_added_to_cart",
+      "actor_id": "cid-1",
+      "client_id": "cid-1",
+      "visitor_id": "vis-1",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "raw": {
+        "quantity": 1,
+        "product_id": "SYNTH:9eaf7992e957d656"
+      }
+    }
+  },
+  "click_useful": {
+    "topic": "intent.click",
+    "key": "bbb_shop:cid-1",
+    "value": {
+      "schema_version": 1,
+      "type": "click",
+      "message_key": "sh-CLICK-1",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-CLICK-1",
+      "event_name": "click",
+      "actor_id": "cid-1",
+      "client_id": "cid-1",
+      "visitor_id": "vis-1",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "click": {
+        "x": 10,
+        "y": 20,
+        "tag_name": "BUTTON",
+        "element_id": "add",
+        "element_name": null,
+        "element_type": "submit",
+        "element_value": "Add",
+        "href": null
+      },
+      "signals": {
+        "url_changed": false,
+        "cart_changed": true,
+        "ui_changed": false,
+        "meaningful_scroll": false
+      },
+      "click_bucket": "useful_click",
+      "raw": {
+        "event_id": "sh-CLICK-1",
+        "event_name": "click",
+        "occurred_at": "2026-10-05T05:00:00.000Z",
+        "client_id": "cid-1",
+        "visitor_id": "vis-1",
+        "session_id": null,
+        "actor_id": null,
+        "url": "https://blabliblulife.com/products/x",
+        "referrer": null,
+        "user_agent": "UA",
+        "data": {
+          "click": {
+            "x": 10,
+            "y": 20,
+            "tag_name": "BUTTON",
+            "element_id": "add",
+            "element_name": null,
+            "element_type": "submit",
+            "element_value": "Add",
+            "href": null
+          },
+          "signals": {
+            "url_changed": false,
+            "cart_changed": true,
+            "ui_changed": false,
+            "meaningful_scroll": false
+          }
+        }
+      }
+    }
+  },
+  "click_dead": {
+    "topic": "intent.click",
+    "key": "bbb_shop:cid-1",
+    "value": {
+      "schema_version": 1,
+      "type": "click",
+      "message_key": "sh-CLICK-2",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-CLICK-2",
+      "event_name": "click",
+      "actor_id": "cid-1",
+      "client_id": "cid-1",
+      "visitor_id": "vis-1",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "click": {
+        "x": 10,
+        "y": 20,
+        "tag_name": "BUTTON",
+        "element_id": "add",
+        "element_name": null,
+        "element_type": "submit",
+        "element_value": "Add",
+        "href": null
+      },
+      "signals": {
+        "url_changed": false,
+        "cart_changed": false,
+        "ui_changed": false,
+        "meaningful_scroll": false
+      },
+      "click_bucket": "dead_click",
+      "raw": {
+        "event_id": "sh-CLICK-2",
+        "event_name": "click",
+        "occurred_at": "2026-10-05T05:00:00.000Z",
+        "client_id": "cid-1",
+        "visitor_id": "vis-1",
+        "session_id": null,
+        "actor_id": null,
+        "url": "https://blabliblulife.com/products/x",
+        "referrer": null,
+        "user_agent": "UA",
+        "data": {
+          "click": {
+            "x": 10,
+            "y": 20,
+            "tag_name": "BUTTON",
+            "element_id": "add",
+            "element_name": null,
+            "element_type": "submit",
+            "element_value": "Add",
+            "href": null
+          },
+          "signals": {
+            "url_changed": false,
+            "cart_changed": false,
+            "ui_changed": false,
+            "meaningful_scroll": false
+          }
+        }
+      }
+    }
+  },
+  "scroll_depth": {
+    "topic": "intent.other",
+    "key": "bbb_shop:cid-1",
+    "value": {
+      "schema_version": 1,
+      "type": "event",
+      "message_key": "sh-SC-1",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-SC-1",
+      "event_name": "scroll_depth",
+      "actor_id": "cid-1",
+      "client_id": "cid-1",
+      "visitor_id": "vis-1",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "raw": {
+        "percent": 50
+      }
+    }
+  },
+  "actor_explicit": {
+    "topic": "intent.other",
+    "key": "bbb_shop:actor-9",
+    "value": {
+      "schema_version": 1,
+      "type": "event",
+      "message_key": "sh-ACT-1",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-ACT-1",
+      "event_name": "page_viewed",
+      "actor_id": "actor-9",
+      "client_id": "cid-1",
+      "visitor_id": "vis-1",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "raw": {}
+    }
+  },
+  "actorless": {
+    "topic": "intent.other",
+    "key": "bbb_shop:event:sh-NOACT-1",
+    "value": {
+      "schema_version": 1,
+      "type": "event",
+      "message_key": "sh-NOACT-1",
+      "brand_id": "bbb_shop",
+      "event_id": "sh-NOACT-1",
+      "event_name": "page_viewed",
+      "actor_id": null,
+      "client_id": null,
+      "visitor_id": "vis-only",
+      "session_id": null,
+      "occurred_at": "2026-10-05T10:30:00.000Z",
+      "url": "https://blabliblulife.com/products/x",
+      "referrer": null,
+      "user_agent": "UA",
+      "session_start": null,
+      "session_end": null,
+      "session_time_spent": null,
+      "raw": {}
+    }
+  }
+}
