@@ -105,58 +105,89 @@ def record(topic: str, partition: int, offset: int, message: Any, key: bytes = b
 PARTITION_COUNTS = {"intent.checkout": 2, "intent.atc": 2, "intent.click": 3, "intent.other": 3}
 
 
-class FakeKafka:
-    """confluent_kafka.Consumer stand-in. `log` is shared with the fake database so tests
-    can assert the order of MySQL commits and offset commits."""
+class FakeBroker:
+    """Per-partition logs and committed offsets shared by the fake consumers, like a real broker."""
 
-    def __init__(self, batches: List[list], log: List[tuple], counts: Optional[Dict[str, int]] = None,
-                 assigned: Optional[List[tuple]] = None) -> None:
-        self.batches = list(batches)
-        self.log = log
+    def __init__(self, counts=None, log=None):
         self.counts = dict(counts or PARTITION_COUNTS)
-        self.assigned = assigned if assigned is not None else [(t, p) for t, n in self.counts.items() for p in range(n)]
-        self.positions: Dict[tuple, int] = {}
-        self.paused: set = set()
-        self.pause_calls: List[list] = []
-        self.resume_calls: List[list] = []
-        self.commits: List[Dict] = []
-        self.seeks: List[tuple] = []
-        self.closed = False
+        self.logs = {(t, p): [] for t, n in self.counts.items() for p in range(n)}
+        self.committed = {}
+        self.log = log if log is not None else []
+        self.created = []          # every consumer the factory handed out
+        self.delay = {}            # (topic, partition) -> consume() calls before it delivers: a lagging topic
         self.fail_commit = False
-        self.fail_seek = False
-        self.on_empty = None
+        self.read_limit = None     # records one consume() may return, like a fetch that is smaller than the backlog
 
-    def subscribe(self, topics, on_assign=None, on_revoke=None, on_lost=None):
-        self.topics = topics
+    def put(self, topic, partition, body, ts=1000, key=b"bbb_shop:cid-1"):
+        """Appends a record (a message dict, bytes, or None) and returns its offset."""
+        log = self.logs[(topic, partition)]
+        payload = body if isinstance(body, (bytes, type(None))) else encode(body)
+        log.append(FakeMsg(topic, partition, len(log), payload, key, ts=ts))
+        return len(log) - 1
 
-    def high(self, key):
-        offsets = [m.offset() for batch in self.batches + [self._served] for m in batch
-                   if (m.topic(), m.partition()) == key]
-        return max(offsets) + 1 if offsets else 0
+    def factory(self):
+        consumer = FakeKafka(self)
+        self.created.append(consumer)
+        return consumer
 
-    _served: list = []
 
-    def consume(self, num_messages, timeout):
-        if self.batches:
-            batch = self.batches.pop(0)
-            self._served = list(self._served) + batch
-            for m in batch:
-                self.positions[(m.topic(), m.partition())] = m.offset() + 1
-            return batch
-        if self.on_empty:
-            self.on_empty()
-        return []
+class FakeKafka:
+    """confluent_kafka.Consumer stand-in for a cycle: never subscribed, partitions assigned by hand."""
 
-    def assignment(self):
+    def __init__(self, broker: FakeBroker) -> None:
         from confluent_kafka import TopicPartition
-        return [TopicPartition(t, p) for t, p in self.assigned]
 
-    def position(self, tps):
-        from confluent_kafka import TopicPartition
-        return [TopicPartition(tp.topic, tp.partition, self.positions.get((tp.topic, tp.partition), -1001)) for tp in tps]
+        self._TP = TopicPartition
+        self.broker = broker
+        self.log = broker.log
+        self.positions = {}
+        self.paused = set()
+        self.pause_calls, self.resume_calls, self.commits = [], [], []
+        self.delay = dict(broker.delay)
+        self.closed = False
+        self.assigned = []
+
+    # metadata and offsets
+    def list_topics(self, timeout=None):
+        return types.SimpleNamespace(topics={t: types.SimpleNamespace(partitions={i: None for i in range(n)}, error=None)
+                                             for t, n in self.broker.counts.items()})
+
+    def committed(self, tps, timeout=None):
+        return [self._TP(tp.topic, tp.partition, self.broker.committed.get((tp.topic, tp.partition), -1001)) for tp in tps]
 
     def get_watermark_offsets(self, tp, timeout=None, cached=False):
-        return (0, self.high((tp.topic, tp.partition)))
+        return (0, len(self.broker.logs[(tp.topic, tp.partition)]))
+
+    def offsets_for_times(self, tps, timeout=None):
+        out = []
+        for tp in tps:
+            hit = next((m.offset() for m in self.broker.logs[(tp.topic, tp.partition)] if m._ts >= tp.offset), -1)
+            out.append(self._TP(tp.topic, tp.partition, hit))
+        return out
+
+    # reading
+    def assign(self, tps):
+        self.assigned = [(tp.topic, tp.partition) for tp in tps]
+        self.positions = {(tp.topic, tp.partition): tp.offset for tp in tps}
+
+    def position(self, tps):
+        return [self._TP(tp.topic, tp.partition, self.positions.get((tp.topic, tp.partition), -1001)) for tp in tps]
+
+    def consume(self, num_messages, timeout):
+        out = []
+        if self.broker.read_limit:
+            num_messages = min(num_messages, self.broker.read_limit)
+        for key in self.assigned:
+            if key in self.paused:
+                continue
+            if self.delay.get(key, 0) > 0:
+                self.delay[key] -= 1
+                continue
+            log = self.broker.logs[key]
+            while self.positions[key] < len(log) and len(out) < num_messages:
+                out.append(log[self.positions[key]])
+                self.positions[key] += 1
+        return out
 
     def pause(self, tps):
         self.pause_calls.append([(t.topic, t.partition) for t in tps])
@@ -166,24 +197,18 @@ class FakeKafka:
         self.resume_calls.append([(t.topic, t.partition) for t in tps])
         self.paused -= {(t.topic, t.partition) for t in tps}
 
-    def list_topics(self, timeout=None):
-        return types.SimpleNamespace(topics={t: types.SimpleNamespace(partitions={i: None for i in range(n)})
-                                             for t, n in self.counts.items()})
-
+    # committing
     def commit(self, offsets, asynchronous):
         assert asynchronous is False, "offset commits must be synchronous"
-        if self.fail_commit:
+        if self.broker.fail_commit:
             raise RuntimeError("commit failed")
         snapshot = {(tp.topic, tp.partition): tp.offset for tp in offsets}
         self.commits.append(snapshot)
+        self.broker.committed.update(snapshot)
         self.log.append(("offset_commit", snapshot))
 
-    def seek(self, tp):
-        if self.fail_seek:
-            raise RuntimeError("seek failed")
-        self.seeks.append((tp.topic, tp.partition, tp.offset))
-
-    def close(self): self.closed = True
+    def close(self):
+        self.closed = True
 
 
 class FakeDlq:
@@ -219,6 +244,7 @@ class FakeDb:
         self.stores = stores or {1: InMemoryIntentStore(), 2: InMemoryIntentStore()}
         self.fail_brand: Dict[int, Exception] = {}
         self.fail_commit: Dict[int, Exception] = {}
+        self.on_commit = None          # called after each MySQL commit (tests use it to stop a cycle mid-way)
         self.closed = False
 
     @contextlib.contextmanager
@@ -236,6 +262,8 @@ class FakeDb:
             self.log.append(("rollback", brand_index))
             raise
         self.log.append(("mysql_commit", brand_index))
+        if self.on_commit:
+            self.on_commit()
 
     def close(self):
         self.closed = True

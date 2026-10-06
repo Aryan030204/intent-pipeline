@@ -83,6 +83,51 @@ class BrandConnections:
             self._discard(brand_index)
 
 
+class RunLock:
+    """Keeps two workers from running an ingest cycle at once: a MySQL named lock (GET_LOCK) held on a
+    dedicated connection for the length of the cycle. It is taken without waiting, so a second worker
+    skips its cycle (and says so) instead of queueing behind the first. The server releases the lock by
+    itself if the holder's connection dies."""
+
+    def __init__(self, connection_factory: Callable, brand_index: int, name: str) -> None:
+        self._factory, self._brand_index, self._name = connection_factory, brand_index, name[:64]
+        self._manager = None
+        self._connection = None
+
+    def acquire(self) -> bool:
+        manager = self._factory(self._brand_index)
+        connection = manager.__enter__()
+        try:
+            cursor = connection.cursor(dictionary=True, buffered=True)
+            cursor.execute("SELECT GET_LOCK(%s, 0) AS got", (self._name,))
+            got = cursor.fetchall()[0]["got"]
+            cursor.close()
+        except Exception:
+            manager.__exit__(None, None, None)
+            raise
+        if got != 1:
+            manager.__exit__(None, None, None)
+            return False
+        self._manager, self._connection = manager, connection
+        return True
+
+    def release(self) -> None:
+        if self._manager is None:
+            return
+        try:
+            cursor = self._connection.cursor(dictionary=True, buffered=True)
+            cursor.execute("SELECT RELEASE_LOCK(%s) AS released", (self._name,))
+            cursor.fetchall()
+            cursor.close()
+        except Exception:
+            pass                      # closing the connection releases it anyway
+        finally:
+            try:
+                self._manager.__exit__(None, None, None)
+            finally:
+                self._manager = self._connection = None
+
+
 def verify_brand_schemas(brand_indices: Iterable[int]) -> None:
     """Startup check, read-only. Raises SchemaMissing naming the brand database that is not
     ready. All mapped brands must pass: records of different brands share Kafka partitions,

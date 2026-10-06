@@ -27,19 +27,19 @@ VALID_CLICK_BUCKETS = ("useful_click", "dead_click")
 MAX_ID_LENGTH = 100
 ATC_EVENT_NAME = "product_added_to_cart"
 
-# Topic each event name is routed to by /track (services/intent/topicRouting.js). Used
-# only to log a mismatch; the consumer handles a record by its content, not its topic.
+# Topic each event name is routed to by /track. Used only to log a mismatch; the consumer handles a
+# record by its content, not its topic. The rules:
+#   checkout_started, checkout_completed        -> intent.checkout
+#   a name containing add_to_cart / added_to_cart -> intent.atc
+#   click                                       -> intent.click
+#   everything else                             -> intent.other
 TOPIC_CHECKOUT = "intent.checkout"
 TOPIC_ATC = "intent.atc"
 TOPIC_CLICK = "intent.click"
 TOPIC_OTHER = "intent.other"
 INTENT_TOPICS = (TOPIC_CHECKOUT, TOPIC_ATC, TOPIC_CLICK, TOPIC_OTHER)
-_EVENT_TOPICS = {
-    "checkout_started": TOPIC_CHECKOUT,
-    "product_added_to_cart": TOPIC_ATC,
-    "add_to_cart": TOPIC_ATC,
-    "click": TOPIC_CLICK,
-}
+CHECKOUT_EVENTS = ("checkout_started", "checkout_completed")
+ATC_NAME_PARTS = ("add_to_cart", "added_to_cart")
 
 
 class InvalidMessage(ValueError):
@@ -99,7 +99,14 @@ class IntentMessage:
 
 
 def expected_topic(event_name: str) -> str:
-    return _EVENT_TOPICS.get(event_name, TOPIC_OTHER)
+    name = (event_name or "").lower()
+    if name in CHECKOUT_EVENTS:
+        return TOPIC_CHECKOUT
+    if any(part in name for part in ATC_NAME_PARTS):
+        return TOPIC_ATC
+    if name == "click":
+        return TOPIC_CLICK
+    return TOPIC_OTHER
 
 
 def _text(

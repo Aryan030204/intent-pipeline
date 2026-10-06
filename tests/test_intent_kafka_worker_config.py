@@ -1,97 +1,52 @@
-import threading
-
 import pytest
 
 import workers.intent_kafka_worker as worker
 from pipeline.intent_kafka_consumer import ConsumerConfig
 
+ENV = ("KAFKA_BOOTSTRAP_SERVERS", "INTENT_KAFKA_GROUP_ID", "INTENT_KAFKA_TOPICS", "INTENT_DLQ_TOPIC", "INTENT_EVENTS_BATCH",
+       "INTENT_KAFKA_RUN_EVERY_MINUTES", "INTENT_EVENTS_CHECK_INTERVAL_S", "INTENT_KAFKA_MAX_ATTEMPTS", "SESSION_TIMEOUT",
+       "INTENT_KAFKA_ORDER_SLACK_S", "INTENT_KAFKA_ORDER_BUFFER_MAX")
 
-def test_defaults_match_the_documented_deployment(monkeypatch):
-    for name in ("KAFKA_BOOTSTRAP_SERVERS", "INTENT_KAFKA_GROUP_ID", "INTENT_KAFKA_TOPICS", "INTENT_DLQ_TOPIC",
-                 "INTENT_KAFKA_BATCH_SIZE", "INTENT_KAFKA_BATCH_WAIT_S", "INTENT_KAFKA_MAX_ATTEMPTS", "SESSION_TIMEOUT"):
+
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    for name in ENV:                       # a developer's .env may set any of these
         monkeypatch.delenv(name, raising=False)
+
+
+def test_defaults_match_the_documented_deployment():
     config = worker.config_from_env()
     assert config.bootstrap_servers == "kafka-service:9092"          # service name, never an IP
-    assert config.group_id == "intent-pipeline-workers"
     assert config.topics == ("intent.checkout", "intent.atc", "intent.click", "intent.other")
     assert config.dlq_topic == "intent.dlq"
-    assert (config.batch_size, config.batch_wait_s, config.max_record_attempts, config.session_timeout_s) == (200, 1.0, 3, 1800)
+    assert (config.events_batch, config.run_every_minutes, config.check_interval_s) == (500, 25.0, 30.0)
+    assert (config.max_record_attempts, config.session_timeout_s, config.order_slack_s) == (3, 1800, 10.0)
 
 
 def test_environment_overrides(monkeypatch):
     monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "broker-a:9092")
-    monkeypatch.setenv("INTENT_KAFKA_GROUP_ID", "intent-group-2")
     monkeypatch.setenv("INTENT_KAFKA_TOPICS", "intent.click, intent.other")
-    monkeypatch.setenv("INTENT_KAFKA_BATCH_SIZE", "50")
+    monkeypatch.setenv("INTENT_EVENTS_BATCH", "2000")
+    monkeypatch.setenv("INTENT_KAFKA_RUN_EVERY_MINUTES", "10")
+    monkeypatch.setenv("INTENT_EVENTS_CHECK_INTERVAL_S", "5")
     monkeypatch.setenv("SESSION_TIMEOUT", "900")
     config = worker.config_from_env()
-    assert (config.bootstrap_servers, config.group_id, config.topics) == ("broker-a:9092", "intent-group-2", ("intent.click", "intent.other"))
-    assert config.batch_size == 50 and config.session_timeout_s == 900
+    assert (config.bootstrap_servers, config.topics) == ("broker-a:9092", ("intent.click", "intent.other"))
+    assert (config.events_batch, config.run_every_minutes, config.check_interval_s, config.session_timeout_s) == (2000, 10.0, 5.0, 900)
 
 
-@pytest.mark.parametrize("name, value", [("INTENT_KAFKA_BATCH_SIZE", "abc"), ("INTENT_KAFKA_BATCH_SIZE", "0"),
-                                         ("INTENT_KAFKA_MAX_ATTEMPTS", "-1"), ("INTENT_KAFKA_BATCH_WAIT_S", "soon")])
+@pytest.mark.parametrize("name, value", [("INTENT_EVENTS_BATCH", "abc"), ("INTENT_EVENTS_BATCH", "0"),
+                                         ("INTENT_KAFKA_MAX_ATTEMPTS", "-1"), ("INTENT_KAFKA_RUN_EVERY_MINUTES", "soon"),
+                                         ("INTENT_KAFKA_RUN_EVERY_MINUTES", "0"), ("INTENT_EVENTS_CHECK_INTERVAL_S", "0")])
 def test_invalid_numbers_stop_the_worker_at_startup(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(SystemExit):
         worker.config_from_env()
 
 
-def test_one_consumer_group_for_every_topic():
-    """A single group id for the whole stream: Kafka splits partitions between members, so
-    consumers are parallel and never duplicate."""
+def test_offsets_are_committed_under_one_group_name_and_there_is_one_consumer_setup_for_every_topic():
     assert worker.DEFAULT_GROUP_ID == "intent-pipeline-workers"
-    settings = ConsumerConfig().kafka_settings("c0")
-    assert settings["group.id"] == worker.DEFAULT_GROUP_ID
-
-
-def test_thread_count_is_bounded_by_the_partition_total():
-    assert worker.DEFAULT_THREADS <= worker.MAX_THREADS == 10
-
-
-def test_a_dying_consumer_stops_the_others_and_fails_the_process():
-    stop = threading.Event()
-
-    class Dies:
-        name = "dies"
-        def run(self): raise RuntimeError("fatal")
-
-    class Waits:
-        name = "waits"
-        def run(self): stop.wait(5)
-
-    assert worker.run_threads([Dies(), Waits()], stop) == 1
-    assert stop.is_set()
-
-
-def test_clean_exit_returns_zero():
-    class Quick:
-        name = "quick"
-        def run(self): pass
-
-    assert worker.run_threads([Quick(), Quick()], threading.Event()) == 0
-
-
-# ---------------- ordering settings ----------------
-
-def test_ordering_defaults_are_one_consumer_a_ten_second_slack_and_a_bounded_buffer(monkeypatch):
-    for name in ("INTENT_KAFKA_ORDERING_DOMAIN", "INTENT_KAFKA_ORDER_SLACK_S", "INTENT_KAFKA_ORDER_BUFFER_MAX",
-                 "INTENT_KAFKA_CONSUMER_THREADS"):
-        monkeypatch.delenv(name, raising=False)
-    config = worker.config_from_env()
-    assert (config.ordering_domain, config.order_slack_s, config.order_buffer_max) == ("single", 10.0, 2000)
-    assert worker.DEFAULT_THREADS == 1
-
-
-def test_ordering_overrides_and_validation(monkeypatch):
-    monkeypatch.setenv("INTENT_KAFKA_ORDERING_DOMAIN", "copartitioned")
-    monkeypatch.setenv("INTENT_KAFKA_ORDER_SLACK_S", "4")
-    monkeypatch.setenv("INTENT_KAFKA_ORDER_BUFFER_MAX", "500")
-    config = worker.config_from_env()
-    assert (config.ordering_domain, config.order_slack_s, config.order_buffer_max) == ("copartitioned", 4.0, 500)
-    monkeypatch.setenv("INTENT_KAFKA_ORDERING_DOMAIN", "anything")
-    with pytest.raises(SystemExit, match="single or copartitioned"):
-        worker.config_from_env()
+    assert ConsumerConfig().kafka_settings("c0")["group.id"] == worker.DEFAULT_GROUP_ID
 
 
 # ---------------- INTENT_DB_MAP validation ----------------
@@ -125,14 +80,6 @@ def test_the_env_file_example_maps_exactly_the_production_brands():
     assert mapping == PRODUCTION_MAP
 
 
-def test_threads_above_one_are_refused_in_single_mode(monkeypatch):
-    monkeypatch.setenv("INTENT_KAFKA_CONSUMER_THREADS", "2")
-    monkeypatch.delenv("INTENT_KAFKA_ORDERING_DOMAIN", raising=False)
-    monkeypatch.setattr(worker, "resolve_brands", lambda: pytest.fail("must refuse before touching brands"))
-    with pytest.raises(SystemExit, match="ordering guarantee"):
-        worker.main()
-
-
 # ---------------- --preflight ----------------
 
 def _preflight_with(monkeypatch, *, brands, schema_ok, topics_ok):
@@ -142,8 +89,6 @@ def _preflight_with(monkeypatch, *, brands, schema_ok, topics_ok):
     monkeypatch.setattr(kdb, "verify_brand_schemas",
                         lambda idx: None if schema_ok(idx[0]) else (_ for _ in ()).throw(RuntimeError("missing table intent_actor_cursors")))
     monkeypatch.setattr(worker, "check_topics", lambda cfg: None if topics_ok else (_ for _ in ()).throw(SystemExit("Kafka topics missing: ['intent.dlq']")))
-    monkeypatch.delenv("INTENT_KAFKA_CONSUMER_THREADS", raising=False)
-    monkeypatch.delenv("INTENT_KAFKA_ORDERING_DOMAIN", raising=False)
     return worker.preflight()
 
 

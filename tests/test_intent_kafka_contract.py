@@ -24,13 +24,15 @@ def test_topic_in_the_fixture_matches_the_workers_routing_table(name):
     assert expected_topic(case["value"]["event_name"]) == case["topic"]
 
 
-def test_the_four_documented_routes():
-    assert expected_topic("checkout_started") == "intent.checkout"
-    assert expected_topic("product_added_to_cart") == "intent.atc"
-    assert expected_topic("add_to_cart") == "intent.atc"
+def test_the_documented_routes():
+    for name in ("checkout_started", "checkout_completed"):
+        assert expected_topic(name) == "intent.checkout"
+    for name in ("product_added_to_cart", "add_to_cart", "cart_item_added_to_cart", "quick_add_to_cart_clicked"):
+        assert expected_topic(name) == "intent.atc"                  # any name containing add_to_cart / added_to_cart
     assert expected_topic("click") == "intent.click"
-    assert expected_topic("page_viewed") == "intent.other"
-    assert expected_topic("anything_new") == "intent.other"
+    for name in ("page_viewed", "product_viewed", "scroll_depth", "cart_viewed", "anything_new", ""):
+        assert expected_topic(name) == "intent.other"
+    assert expected_topic("CHECKOUT_COMPLETED") == "intent.checkout"   # names are compared case-insensitively
 
 
 def test_event_id_is_used_exactly_as_supplied_and_never_generated():

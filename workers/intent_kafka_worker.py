@@ -1,23 +1,18 @@
 """
 Kafka -> MySQL intent worker (replaces the Mongo ingestion of the intent pipeline).
 
-    intent.checkout, intent.atc, intent.click, intent.other      (one consumer group)
-        -> IntentConsumer batches -> one MySQL transaction per brand -> COMMIT
-        -> manual Kafka offset commit
+    intent.checkout, intent.atc, intent.click, intent.other
+        -> ingest cycle: read what is waiting, in /track send order
+        -> one MySQL transaction per brand -> COMMIT -> manual Kafka offset commit
     poison records -> intent.dlq
 
-One service, one consumer group (INTENT_KAFKA_GROUP_ID, default intent-pipeline-workers)
-subscribed to all four topics. Do not give a second service the same topics under a
-different group id: every event would then be processed twice.
-
-Ordering. An actor's events sit on different topics, which Kafka does not order against each
-other, so the consumer releases records in Kafka-timestamp order behind a watermark (see
-pipeline/intent_kafka_ordering.py). That holds only while ONE consumer owns every partition
-an actor can land on:
-  INTENT_KAFKA_ORDERING_DOMAIN=single (default)       exactly one consumer in the group
-  INTENT_KAFKA_ORDERING_DOMAIN=copartitioned          all topics have the same partition count,
-                                                      so several consumers can share the load
-A consumer whose assignment breaks the domain pauses and logs ordering_domain_violated.
+It does not poll continuously. A cycle runs when either trigger fires:
+  * batch completion: the events waiting across ALL topics reach INTENT_EVENTS_BATCH. The count is read
+    from Kafka offsets every INTENT_EVENTS_CHECK_INTERVAL_S seconds (end offset - committed offset);
+    no records are consumed to take it.
+  * schedule: every INTENT_KAFKA_RUN_EVERY_MINUTES (default 25), whatever is waiting, and once at startup.
+Cycles never overlap, in this process (one at a time) or across containers (a MySQL named lock: a second
+worker skips its cycle and logs it). Run one worker.
 
 Environment: see .env.example (Kafka section).
 """
@@ -29,6 +24,8 @@ import signal
 import socket
 import sys
 import threading
+from datetime import datetime
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -48,13 +45,14 @@ from pipeline.intent_kafka_consumer import (  # noqa: E402
     DEFAULT_DLQ_TOPIC,
     DEFAULT_GROUP_ID,
     ConsumerConfig,
-    IntentConsumer,
+    CycleResult,
+    IntentIngestor,
 )
 from pipeline.intent_kafka_contract import INTENT_TOPICS  # noqa: E402
 from pipeline.state import logger  # noqa: E402
 
-DEFAULT_THREADS = 1  # one consumer owns every partition, which the ordering guarantee needs (domain single)
-MAX_THREADS = 10
+SCHEDULER_TIMEZONE = "Asia/Kolkata"
+SHUTDOWN_WAIT_S = 50
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -70,14 +68,17 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     return value
 
 
-def _env_float(name: str, default: float) -> float:
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         raise SystemExit(f"{name} must be a number, got {raw!r}")
+    if value < minimum:
+        raise SystemExit(f"{name} must be at least {minimum}, got {value}")
+    return value
 
 
 def config_from_env() -> ConsumerConfig:
@@ -88,22 +89,14 @@ def config_from_env() -> ConsumerConfig:
         group_id=os.environ.get("INTENT_KAFKA_GROUP_ID", DEFAULT_GROUP_ID).strip() or DEFAULT_GROUP_ID,
         topics=topics,
         dlq_topic=os.environ.get("INTENT_DLQ_TOPIC", DEFAULT_DLQ_TOPIC).strip() or DEFAULT_DLQ_TOPIC,
-        batch_size=_env_int("INTENT_KAFKA_BATCH_SIZE", 200),
-        batch_wait_s=_env_float("INTENT_KAFKA_BATCH_WAIT_S", 1.0),
+        events_batch=_env_int("INTENT_EVENTS_BATCH", 500),
+        run_every_minutes=_env_float("INTENT_KAFKA_RUN_EVERY_MINUTES", 25.0, minimum=1.0),
+        check_interval_s=_env_float("INTENT_EVENTS_CHECK_INTERVAL_S", 30.0, minimum=1.0),
         max_record_attempts=_env_int("INTENT_KAFKA_MAX_ATTEMPTS", 3),
         session_timeout_s=_env_int("SESSION_TIMEOUT", 1800),
-        stats_interval_s=_env_float("INTENT_KAFKA_STATS_INTERVAL_S", 60.0),
-        ordering_domain=_env_domain(),
         order_slack_s=_env_float("INTENT_KAFKA_ORDER_SLACK_S", 10.0),
         order_buffer_max=_env_int("INTENT_KAFKA_ORDER_BUFFER_MAX", 2000),
     )
-
-
-def _env_domain() -> str:
-    value = os.environ.get("INTENT_KAFKA_ORDERING_DOMAIN", "single").strip().lower() or "single"
-    if value not in ("single", "copartitioned"):
-        raise SystemExit(f"INTENT_KAFKA_ORDERING_DOMAIN must be single or copartitioned, got {value!r}")
-    return value
 
 
 def check_topics(config: ConsumerConfig) -> None:
@@ -172,24 +165,67 @@ def resolve_brands():
     return resolved
 
 
-def run_threads(consumers, stop_event: threading.Event) -> int:
-    """Runs each consumer in its own thread. Returns the process exit code."""
-    failures = []
+class CycleController:
+    """Runs ingest cycles for the two triggers, one at a time."""
 
-    def target(consumer):
+    def __init__(self, ingestor: IntentIngestor, config: ConsumerConfig, stop_event: threading.Event) -> None:
+        self.ingestor, self.cfg, self.stop_event = ingestor, config, stop_event
+        self._busy = threading.Lock()
+
+    def run(self, reason: str) -> Optional[CycleResult]:
+        """Trigger 2 (schedule) and the body of trigger 1. Skipped if a cycle is already running."""
+        if self.stop_event.is_set():
+            return None
+        if not self._busy.acquire(blocking=False):
+            logger.info(f"[intent-kafka] category=cycle_skipped trigger={reason} a cycle is already running")
+            return None
         try:
-            consumer.run()
-        except BaseException as exc:  # a dead consumer must stop the whole worker
-            failures.append(exc)
-            logger.error(f"[intent-kafka] category=consumer_died name={consumer.name} error={type(exc).__name__}: {exc}")
-            stop_event.set()
+            return self.ingestor.run_cycle(reason)
+        except Exception as exc:  # a failed cycle must never stop the scheduler
+            logger.exception(f"[intent-kafka] category=cycle_crashed trigger={reason} {type(exc).__name__}: {exc}")
+            return None
+        finally:
+            self._busy.release()
 
-    threads = [threading.Thread(target=target, args=(c,), name=c.name) for c in consumers]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    return 1 if failures else 0
+    def check_batch(self) -> Optional[CycleResult]:
+        """Trigger 1: runs a cycle when the events waiting reach INTENT_EVENTS_BATCH."""
+        if self.stop_event.is_set() or self._busy.locked():
+            return None
+        try:
+            pending = self.ingestor.pending_events()
+        except Exception as exc:
+            logger.warning(f"[intent-kafka] category=pending_check_failed {type(exc).__name__}: {exc}")
+            return None
+        if pending < self.cfg.events_batch:
+            return None
+        logger.info(f"[intent-kafka] category=batch_trigger pending={pending} batch={self.cfg.events_batch}")
+        return self.run("batch")
+
+    def drain(self, timeout: float = SHUTDOWN_WAIT_S) -> bool:
+        """Waits for a running cycle to finish (it stops between batches once stop_event is set)."""
+        if self._busy.acquire(timeout=timeout):
+            self._busy.release()
+            return True
+        return False
+
+
+def build_scheduler(controller: CycleController, config: ConsumerConfig):
+    """The schedule trigger (every run_every_minutes, and once now) and the batch trigger's check
+    (every check_interval_s). max_instances=1 and coalesce keep each job from piling up."""
+    from apscheduler.schedulers.blocking import BlockingScheduler
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    scheduler = BlockingScheduler(timezone=SCHEDULER_TIMEZONE)
+    scheduler.add_job(
+        controller.run, IntervalTrigger(seconds=int(config.run_every_minutes * 60), timezone=SCHEDULER_TIMEZONE),
+        args=["schedule"], id="intent_kafka_schedule", max_instances=1, coalesce=True, misfire_grace_time=300,
+        next_run_time=datetime.now(scheduler.timezone),
+    )
+    scheduler.add_job(
+        controller.check_batch, IntervalTrigger(seconds=int(config.check_interval_s), timezone=SCHEDULER_TIMEZONE),
+        id="intent_kafka_batch_check", max_instances=1, coalesce=True, misfire_grace_time=30,
+    )
+    return scheduler
 
 
 def preflight() -> int:
@@ -220,10 +256,6 @@ def preflight() -> int:
     for brand_id, index in sorted((brands or {}).items()):
         check(f"schema ready for {brand_id} (brand_index {index})", lambda index=index: verify_brand_schemas([index]))
     check(f"Kafka topics {list(config.topics)} and DLQ {config.dlq_topic} exist", lambda: check_topics(config))
-    threads = _env_int("INTENT_KAFKA_CONSUMER_THREADS", DEFAULT_THREADS)
-    if threads > 1 and config.ordering_domain == "single":
-        failures.append("consumer threads")
-        logger.error(f"[preflight] FAIL consumer threads: {threads} consumers break ordering domain 'single'")
     logger.info("[preflight] ready to start" if not failures else f"[preflight] NOT READY: {failures}")
     return 1 if failures else 0
 
@@ -234,19 +266,11 @@ def main() -> None:
 
     from confluent_kafka import Consumer, Producer
 
-    from pipeline.intent_kafka_db import BrandConnections, verify_brand_schemas
+    from pipeline.db import get_db_connection
+    from pipeline.intent_kafka_db import BrandConnections, RunLock, verify_brand_schemas
 
     config = config_from_env()
-    thread_count = min(_env_int("INTENT_KAFKA_CONSUMER_THREADS", DEFAULT_THREADS), MAX_THREADS)
-    if thread_count > 1 and config.ordering_domain == "single":
-        raise SystemExit(
-            f"INTENT_KAFKA_CONSUMER_THREADS={thread_count} would split the partitions between consumers and break "
-            f"the cross-topic ordering guarantee. Use 1, or set INTENT_KAFKA_ORDERING_DOMAIN=copartitioned after "
-            f"giving all four topics the same partition count."
-        )
-
     brands = resolve_brands()
-    resolver = brands.get
     verify_brand_schemas(sorted(set(brands.values())))
     check_topics(config)
 
@@ -256,36 +280,42 @@ def main() -> None:
         {"bootstrap.servers": config.bootstrap_servers, "client.id": f"{host}-intent-dlq", "acks": "all",
          "enable.idempotence": True}
     )
-    consumers = [
-        IntentConsumer(
-            Consumer(config.kafka_settings(f"{host}-intent-{n}")),
-            dlq,
-            BrandConnections(),
-            resolver,
-            config,
-            stop_event,
-            name=f"consumer-{n}",
-        )
-        for n in range(thread_count)
-    ]
+    ingestor = IntentIngestor(
+        lambda: Consumer(config.kafka_settings(f"{host}-intent")),
+        dlq,
+        BrandConnections(),
+        brands.get,
+        config,
+        stop_event,
+        run_lock=RunLock(get_db_connection, min(brands.values()), f"intent-kafka:{config.group_id}"),
+    )
+    controller = CycleController(ingestor, config, stop_event)
+    scheduler = build_scheduler(controller, config)
 
     # Installed after the imports above: pipeline.db registers handlers on import that
     # raise SystemExit, which would abort a batch between MySQL COMMIT and the offset commit.
     def request_stop(signum, _frame):
         logger.info(f"[intent-kafka] received signal {signum}; finishing the current batch, then exiting")
         stop_event.set()
+        scheduler.shutdown(wait=False)
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
 
     logger.info(
-        f"[intent-kafka] starting threads={thread_count} group={config.group_id} "
-        f"brokers={config.bootstrap_servers} topics={list(config.topics)} dlq={config.dlq_topic}"
+        f"[intent-kafka] starting brokers={config.bootstrap_servers} topics={list(config.topics)} dlq={config.dlq_topic} "
+        f"batch={config.events_batch} schedule=every {config.run_every_minutes:g} min "
+        f"batch_check=every {config.check_interval_s:g}s slack={config.order_slack_s:g}s"
     )
-    code = run_threads(consumers, stop_event)
-    dlq.flush(30)
-    logger.info("[intent-kafka] stopped cleanly" if code == 0 else "[intent-kafka] stopped after a consumer failure")
-    sys.exit(code)
+    try:
+        scheduler.start()                       # blocks until request_stop
+    finally:
+        stop_event.set()
+        finished = controller.drain()
+        ingestor.close()
+        dlq.flush(30)
+    logger.info("[intent-kafka] stopped cleanly" if finished else "[intent-kafka] stopped; a cycle was still finishing")
+    sys.exit(0 if finished else 1)
 
 
 if __name__ == "__main__":
