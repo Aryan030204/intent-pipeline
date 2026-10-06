@@ -145,12 +145,29 @@ closed, the DLQ producer flushed and the MySQL connections closed. `stop_grace_p
 
 ## Deploying
 
-1. Add `intent.dlq 1 604800000 1073741824` to `kafka-service/topics.conf`; re-run `kafka-init`.
-2. Apply `migrations/001_intent_kafka_state.sql` to PTS and SHYLENEW (BBB already has it).
-3. Set the variables in `.env.example`; make sure `INTENT_DB_MAP` covers every brand in alerts-service.
-4. Start `intent-kafka-worker`. Healthy logs: `consumer_started`, `partitions_assigned`, then
-   `batch_committed` followed by `offsets_committed`; `stats` lines every minute show per-partition lag.
-   Alarm on `mysql_transaction_failed` that repeats, `poison_quarantined`, `dlq_delivery_failed`, `kafka_retry`.
+Order matters. Steps 1-2 change shared infrastructure and production databases and are done by a person.
+
+1. `kafka-service/topics.conf`: add `intent.dlq 1 604800000 1073741824`; re-run `kafka-init`. (Without it the worker exits.)
+2. Apply `migrations/001_intent_kafka_state.sql` to PTS and SHYLENEW (BBB already has the tables). It is idempotent.
+3. `.env`: copy the variables from `.env.example`; keep `INTENT_KAFKA_CONSUMER_THREADS=1` and
+   `INTENT_KAFKA_ORDERING_DOMAIN=single`; `INTENT_DB_MAP` must list every brand in alerts-service.
+4. On the host, before starting: `docker compose run --rm intent-kafka-worker python workers/intent_kafka_worker.py --preflight`.
+   It runs every startup check independently (settings, INTENT_DB_MAP, each brand's schema, topics and DLQ) and lists
+   all failures; exit code 0 means ready. It only reads (`information_schema`, Kafka metadata).
+5. Start **one** `intent-kafka-worker`. Never a second: it would pause both (`ordering_domain_violated`).
+6. Stop and remove the old `intent-data-aggregation` Mongo ingestion only after the worker is committing: the
+   restored aggregation container no longer reads Mongo, it only runs rollups.
+
+Healthy logs: `consumer_started`, `ordering_domain_ok partitions=10`, `partitions_assigned`, then `batch_committed`
+followed by `offsets_committed` (about 11 s after an event, the ordering slack), and `stats` lines each minute with
+per-partition lag. Alarm on: `mysql_transaction_failed` repeating, `poison_quarantined`, `dlq_delivery_failed`,
+`kafka_retry`, `ordering_domain_violated`, `order_violation`, `ordering_wait`.
+
+Rollback: stop the worker. Offsets stay committed in Kafka (7-day retention); restarting resumes where it stopped.
+Replaying is safe because every write is idempotent. Migration 001 only adds tables; nothing needs undoing.
+
+Image note: the Dockerfile copies the whole repo, so a local `.env` is baked into any image built on that machine.
+Add a `.dockerignore` (at least `.env*`, `.git`, `__pycache__`) before building images you push anywhere.
 
 ## Tests
 

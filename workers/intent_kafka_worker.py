@@ -192,7 +192,46 @@ def run_threads(consumers, stop_event: threading.Event) -> int:
     return 1 if failures else 0
 
 
+def preflight() -> int:
+    """`python workers/intent_kafka_worker.py --preflight`: runs every startup check on its own and
+    reports ALL failures, without consuming or writing anything (information_schema SELECTs and a
+    Kafka metadata request only). Exit code 0 means the worker can start."""
+    from pipeline.intent_kafka_db import verify_brand_schemas
+
+    failures = []
+
+    def check(label, fn):
+        try:
+            result = fn()
+            logger.info(f"[preflight] PASS {label}")
+            return result
+        except SystemExit as exc:
+            failures.append(label)
+            logger.error(f"[preflight] FAIL {label}: {exc}")
+        except Exception as exc:
+            failures.append(label)
+            logger.error(f"[preflight] FAIL {label}: {type(exc).__name__}: {exc}")
+        return None
+
+    config = check("environment settings", config_from_env)
+    if config is None:
+        return 1
+    brands = check("INTENT_DB_MAP resolves to active brand databases", resolve_brands)
+    for brand_id, index in sorted((brands or {}).items()):
+        check(f"schema ready for {brand_id} (brand_index {index})", lambda index=index: verify_brand_schemas([index]))
+    check(f"Kafka topics {list(config.topics)} and DLQ {config.dlq_topic} exist", lambda: check_topics(config))
+    threads = _env_int("INTENT_KAFKA_CONSUMER_THREADS", DEFAULT_THREADS)
+    if threads > 1 and config.ordering_domain == "single":
+        failures.append("consumer threads")
+        logger.error(f"[preflight] FAIL consumer threads: {threads} consumers break ordering domain 'single'")
+    logger.info("[preflight] ready to start" if not failures else f"[preflight] NOT READY: {failures}")
+    return 1 if failures else 0
+
+
 def main() -> None:
+    if "--preflight" in sys.argv:
+        sys.exit(preflight())
+
     from confluent_kafka import Consumer, Producer
 
     from pipeline.intent_kafka_db import BrandConnections, verify_brand_schemas

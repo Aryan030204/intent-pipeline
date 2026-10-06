@@ -131,3 +131,49 @@ def test_threads_above_one_are_refused_in_single_mode(monkeypatch):
     monkeypatch.setattr(worker, "resolve_brands", lambda: pytest.fail("must refuse before touching brands"))
     with pytest.raises(SystemExit, match="ordering guarantee"):
         worker.main()
+
+
+# ---------------- --preflight ----------------
+
+def _preflight_with(monkeypatch, *, brands, schema_ok, topics_ok):
+    import pipeline.intent_kafka_db as kdb
+
+    monkeypatch.setattr(worker, "resolve_brands", brands)
+    monkeypatch.setattr(kdb, "verify_brand_schemas",
+                        lambda idx: None if schema_ok(idx[0]) else (_ for _ in ()).throw(RuntimeError("missing table intent_actor_cursors")))
+    monkeypatch.setattr(worker, "check_topics", lambda cfg: None if topics_ok else (_ for _ in ()).throw(SystemExit("Kafka topics missing: ['intent.dlq']")))
+    monkeypatch.delenv("INTENT_KAFKA_CONSUMER_THREADS", raising=False)
+    monkeypatch.delenv("INTENT_KAFKA_ORDERING_DOMAIN", raising=False)
+    return worker.preflight()
+
+
+def test_preflight_passes_when_everything_is_ready(monkeypatch):
+    assert _preflight_with(monkeypatch, brands=lambda: {"bbb_shop": 2, "pts_shop": 1}, schema_ok=lambda i: True, topics_ok=True) == 0
+
+
+def test_preflight_reports_every_failure_not_just_the_first(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    code = _preflight_with(monkeypatch, brands=lambda: {"bbb_shop": 2, "pts_shop": 1, "shyle_shop": 8},
+                           schema_ok=lambda i: i == 2, topics_ok=False)
+    text = caplog.text
+    assert code == 1
+    assert "PASS schema ready for bbb_shop" in text
+    assert "FAIL schema ready for pts_shop" in text and "FAIL schema ready for shyle_shop" in text
+    assert "FAIL Kafka topics" in text and "NOT READY" in text
+
+
+def test_preflight_fails_on_an_invalid_db_map_without_starting_anything(monkeypatch):
+    def bad():
+        raise SystemExit("INTENT_DB_MAP is invalid: x")
+
+    assert _preflight_with(monkeypatch, brands=bad, schema_ok=lambda i: True, topics_ok=True) == 1
+
+
+def test_preflight_flag_exits_with_its_result_code(monkeypatch):
+    monkeypatch.setattr(worker, "preflight", lambda: 3)
+    monkeypatch.setattr("sys.argv", ["intent_kafka_worker.py", "--preflight"])
+    with pytest.raises(SystemExit) as exit_info:
+        worker.main()
+    assert exit_info.value.code == 3
