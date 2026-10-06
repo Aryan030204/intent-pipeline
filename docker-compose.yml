@@ -5,6 +5,16 @@ networks:
     external: true
 
 services:
+  intent-data-aggregation:
+    build: .
+    container_name: intent-data-aggregation
+    env_file:
+      - .env
+    restart: always
+    networks:
+      - pipeline-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   intent-scoring-worker:
     build:
@@ -14,23 +24,6 @@ services:
     env_file:
       - .env
     restart: always
-    networks:
-      - pipeline-net
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  intent-sqs-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.intent-scoring-worker
-    container_name: intent-sqs-worker
-    command: ["python", "workers/intent_sqs_worker.py"]
-    env_file:
-      - .env
-    environment:
-      AWS_REGION: ap-south-1
-    restart: always
-    stop_grace_period: 45s  # > SQS long poll (20s) + one batch with heartbeat; SIGKILL is still safe via redelivery
     networks:
       - pipeline-net
     extra_hosts:

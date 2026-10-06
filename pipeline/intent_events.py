@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from pymongo import MongoClient
 
 from pipeline.state import IST, logger
 from pipeline.db import (
@@ -106,8 +107,6 @@ def _resolve_intent_events_collection():
     if not mongo_uri:
         raise ValueError("INTENT_MONGO_URI is not configured")
 
-    from pymongo import MongoClient
-
     client = MongoClient(mongo_uri, tz_aware=True)
     return client, client["intent_sessions"]["events"]
 
@@ -117,8 +116,6 @@ def _resolve_intent_click_events_collection():
     if not mongo_uri:
         raise ValueError("INTENT_MONGO_URI is not configured")
 
-    from pymongo import MongoClient
-
     client = MongoClient(mongo_uri, tz_aware=True)
     return client, client["intent_sessions"]["click_events"]
 
@@ -127,8 +124,6 @@ def _resolve_intent_session_history_collection():
     mongo_uri = os.environ.get("INTENT_MONGO_URI")
     if not mongo_uri:
         raise ValueError("INTENT_MONGO_URI is not configured")
-
-    from pymongo import MongoClient
 
     client = MongoClient(mongo_uri, tz_aware=True)
     return client, client["intent_sessions"]["session_history"]
