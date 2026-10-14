@@ -473,3 +473,80 @@ def test_session_times_land_in_the_day_bucket_the_rollups_and_the_event_rows_use
     finally:
         connection.close()
     assert summary == {date(2026, 10, 5): 1, date(2026, 10, 6): 1}   # one session per store-local day, none shifted
+
+
+# ---------------- the bulk writer against the per-message writer, on a real MySQL ----------------
+
+def _stored_state(db):
+    """Everything the writers produce, with session ids renamed by order of first appearance and the
+    columns MySQL fills in itself (ids, timestamps of ingestion) left out."""
+    names = {}
+
+    def canon(session_id):
+        return names.setdefault(session_id, f"S{len(names)}")
+
+    events = db.rows("SELECT event_id, event_name, actor_id, client_id, visitor_id, session_id, product_id, quantity, occurred_at "
+                     "FROM behavioral_events ORDER BY event_id")
+    clicks = db.rows("SELECT event_id, actor_id, session_id, click_bucket, occurred_at FROM click_events ORDER BY event_id")
+    for row in events + clicks:
+        row["session_id"] = canon(row["session_id"])
+    cursors = db.rows("SELECT actor_id, session_id, session_start, last_event_at, last_event_id, events_seq "
+                      "FROM intent_actor_cursors WHERE session_id <> '' ORDER BY actor_id")
+    for row in cursors:
+        row["session_id"], row["events_seq"] = canon(row["session_id"]), _seq(row)
+    atc = sorted((canon(r["session_id"]), r["product_id"]) for r in db.rows("SELECT session_id, product_id FROM intent_atc_dedupe"))
+    sessions = db.rows("SELECT session_id, actor_id, session_start, session_end, session_time_spent_ms, event_count, page_view_count, "
+                       "product_view_count, click_count, useful_click_count, dead_click_count, add_to_cart_count, "
+                       "checkout_started_count, scroll_count, event_sequence FROM intent_sessions")
+    for row in sessions:
+        row["session_id"] = canon(row["session_id"])
+        row["event_sequence"] = json.loads(row["event_sequence"]) if isinstance(row["event_sequence"], (str, bytes)) else row["event_sequence"]
+    sessions.sort(key=lambda r: r["session_id"])
+    return {"events": events, "clicks": clicks, "cursors": cursors, "atc": atc, "sessions": sessions}
+
+
+def test_the_bulk_writer_leaves_the_same_rows_as_the_per_message_writer_on_real_mysql(clean_db, monkeypatch):
+    """NOT RUN in the session that wrote it (no MySQL available). Run with INTENT_TEST_MYSQL_* set before
+    turning INTENT_WRITE_MODE=batch on in production."""
+    import pipeline.intent_kafka_bulk as bulk_module
+    import pipeline.intent_kafka_writer as writer_module
+    from tests.test_intent_kafka_fast_path import deterministic_session_ids, random_batches
+
+    def run(apply, batches):
+        deterministic_session_ids(monkeypatch)
+        connections = BrandConnections(connection_factory=clean_db.factory)
+        paths = []
+        try:
+            for number, batch in enumerate(batches):
+                with connections.transaction(1) as store:
+                    paths.append(apply(store, items(*batch), TIMEOUT).path)
+        finally:
+            connections.close()
+        return paths
+
+    for seed in (1, 7, 23):
+        batches = random_batches(seed, batches=3, size=40)
+        clean_db.truncate_all()
+        run(writer_module.apply_batch, batches)
+        expected = _stored_state(clean_db)
+        clean_db.truncate_all()
+        paths = run(bulk_module.apply_batch_fast, batches)
+        assert _stored_state(clean_db) == expected, f"seed {seed}"
+        assert set(paths) == {"fast"}, f"seed {seed} took the fallback: {paths}"
+
+
+def test_the_bulk_writer_falls_back_on_a_row_mysql_rejects_and_keeps_its_neighbours_on_real_mysql(clean_db):
+    """NOT RUN in the session that wrote it (no MySQL available)."""
+    import pipeline.intent_kafka_bulk as bulk_module
+
+    bad = value("bad", 5, name="product_viewed", raw={"product_id": "p", "product_title": "x" * 600})   # VARCHAR(500)
+    connections = BrandConnections(connection_factory=clean_db.factory)
+    try:
+        with connections.transaction(1) as store:
+            result = bulk_module.apply_batch_fast(store, items(value("ok1", 0), bad, value("ok2", 9)), TIMEOUT)
+    finally:
+        connections.close()
+    assert result.path == "fallback" and len(result.failed) == 1
+    assert [r["event_id"] for r in table(clean_db, "behavioral_events")] == ["ok1", "ok2"]
+    (cursor,) = table(clean_db, "intent_actor_cursors")
+    assert list(_seq(cursor)) == ["1", "2"]

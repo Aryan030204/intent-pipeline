@@ -276,7 +276,7 @@ def manual_trigger():
                 job = scheduler.add_job(
                     run_data_pipeline,
                     "cron",
-                    minute="0,15,30,45",
+                    minute=aws_background.ROLLUP_CRON_MINUTE,
                     second=0,
                     coalesce=True,
                     max_instances=1,

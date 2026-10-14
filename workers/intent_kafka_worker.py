@@ -96,7 +96,16 @@ def config_from_env() -> ConsumerConfig:
         session_timeout_s=_env_int("SESSION_TIMEOUT", 1800),
         order_slack_s=_env_float("INTENT_KAFKA_ORDER_SLACK_S", 10.0),
         order_buffer_max=_env_int("INTENT_KAFKA_ORDER_BUFFER_MAX", 2000),
+        write_mode=_env_write_mode(),
+        fast_path_brands=tuple(b.strip() for b in os.environ.get("INTENT_FAST_PATH_BRANDS", "").split(",") if b.strip()),
     )
+
+
+def _env_write_mode() -> str:
+    value = os.environ.get("INTENT_WRITE_MODE", "safe").strip().lower() or "safe"
+    if value not in ("safe", "batch"):
+        raise SystemExit(f"INTENT_WRITE_MODE must be safe or batch, got {value!r}")
+    return value
 
 
 def check_topics(config: ConsumerConfig) -> None:
@@ -305,7 +314,8 @@ def main() -> None:
     logger.info(
         f"[intent-kafka] starting brokers={config.bootstrap_servers} topics={list(config.topics)} dlq={config.dlq_topic} "
         f"batch={config.events_batch} schedule=every {config.run_every_minutes:g} min "
-        f"batch_check=every {config.check_interval_s:g}s slack={config.order_slack_s:g}s"
+        f"batch_check=every {config.check_interval_s:g}s slack={config.order_slack_s:g}s "
+        f"write_mode={config.write_mode} fast_path_brands={list(config.fast_path_brands) or 'all'}"
     )
     try:
         scheduler.start()                       # blocks until request_stop

@@ -27,8 +27,11 @@ watermark only advances once all five rollups succeed for the run.
 import ast
 import hashlib
 import json
+import os
 import re
+import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -243,6 +246,118 @@ def _ensure_all_rollup_tables(cursor, connection) -> None:
     _ensure_click_behavior_daily_table(cursor, connection)
     _ensure_product_behavior_daily_table(cursor, connection)
     _ensure_behavioral_path_daily_table(cursor, connection)
+
+
+# ---------------------------
+# Where the event rollups read from
+# ---------------------------
+@dataclass(frozen=True)
+class _Source:
+    """The tables the page, click and product rollups read. DIRECT is the real tables. A TEMP source is a
+    one-pass copy of the affected window (same column names, only the columns the rollups use), so the
+    five queries that used to scan behavioral_events / click_events each scan a small private table instead."""
+    events: str
+    clicks: str
+    temp: bool
+
+
+_DIRECT = _Source("behavioral_events", "click_events", False)
+_TEMP_EVENTS, _TEMP_CLICKS = "tmp_rollup_events", "tmp_rollup_clicks"
+_temp_unavailable = False   # set when MySQL refuses temporary tables (privilege, GTID rules); then read directly
+_TEMP_REFUSED_ERRNOS = {1044, 1142, 1227, 1785, 1786, 1787}
+
+
+def _src(sql: str, source: Optional[_Source]) -> str:
+    """The statement unchanged, or with its event tables swapped for the temp copies."""
+    if source is None or not source.temp:
+        return sql
+    return sql.replace("FROM behavioral_events", f"FROM {source.events}").replace("FROM click_events", f"FROM {source.clicks}")
+
+
+def _set_autocommit(connection, value: bool) -> None:
+    try:
+        connection.autocommit = value
+    except Exception:
+        pass
+
+
+def _prepare_source(cursor, connection, dates: List[date]) -> _Source:
+    """INTENT_ROLLUP_SOURCE=direct reads the real tables as before; auto (default) copies the window once into
+    temporary tables. The copy is made outside a transaction (autocommit on) because MySQL with GTIDs refuses
+    CREATE/DROP TEMPORARY TABLE inside one. Any failure means 'read directly', never a failed run."""
+    global _temp_unavailable
+    if os.environ.get("INTENT_ROLLUP_SOURCE", "auto").strip().lower() == "direct" or _temp_unavailable:
+        return _DIRECT
+    start, end = _window_bounds(dates)
+    try:
+        connection.commit()
+        _set_autocommit(connection, True)
+        try:
+            cursor.execute(f"DROP TEMPORARY TABLE IF EXISTS {_TEMP_EVENTS}")
+            cursor.execute(f"DROP TEMPORARY TABLE IF EXISTS {_TEMP_CLICKS}")
+            cursor.execute(
+                f"CREATE TEMPORARY TABLE {_TEMP_EVENTS} AS "
+                "SELECT occurred_at, url, actor_id, session_id, event_name, scroll_percent, product_id, product_title "
+                "FROM behavioral_events WHERE occurred_at >= %s AND occurred_at < %s", (start, end))
+            cursor.execute(
+                f"CREATE TEMPORARY TABLE {_TEMP_CLICKS} AS "
+                "SELECT occurred_at, url, click_tag, click_element_id, click_element_name, click_element_type, "
+                "click_href, click_element_value, click_bucket "
+                "FROM click_events WHERE occurred_at >= %s AND occurred_at < %s", (start, end))
+        finally:
+            _set_autocommit(connection, False)
+        return _Source(_TEMP_EVENTS, _TEMP_CLICKS, True)
+    except Exception as exc:
+        if getattr(exc, "errno", None) in _TEMP_REFUSED_ERRNOS:
+            _temp_unavailable = True
+        logger.warning("[rollup] temporary-table copy not used (%s: %s)%s; reading the tables directly",
+                       type(exc).__name__, str(exc)[:160],
+                       " - disabled for this process" if _temp_unavailable else "")
+        _release_source(cursor, connection, _Source(_TEMP_EVENTS, _TEMP_CLICKS, True))
+        return _DIRECT
+
+
+def _release_source(cursor, connection, source: _Source) -> None:
+    if not source.temp:
+        return
+    try:
+        _set_autocommit(connection, True)
+        cursor.execute(f"DROP TEMPORARY TABLE IF EXISTS {source.events}")
+        cursor.execute(f"DROP TEMPORARY TABLE IF EXISTS {source.clicks}")
+    except Exception as exc:  # the tables vanish with the connection anyway
+        logger.debug("[rollup] could not drop temporary tables: %s", exc)
+    finally:
+        _set_autocommit(connection, False)
+
+
+def _run_stage(stage_name, stage_fn, cursor, connection, dates, source: _Source, brand_label: str) -> bool:
+    """Runs one rollup stage. If it fails while reading the temporary copies, it is retried once against the
+    real tables, which is what it always did. Returns whether the stage succeeded."""
+    try:
+        stage_fn(cursor, connection, dates, source)
+        return True
+    except Exception as exc:
+        failure = exc
+        if source.temp:
+            logger.warning("[rollup %s] brand=%s failed on the temporary copy (%s); retrying on the real tables",
+                           stage_name, brand_label, exc)
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+            try:
+                stage_fn(cursor, connection, dates, _DIRECT)
+                return True
+            except Exception as retry_exc:
+                failure = retry_exc
+        logger.error("[rollup %s] brand=%s failed: %s", stage_name, brand_label, failure)
+        return False
+
+
+# The five CREATE TABLE IF NOT EXISTS checks are idempotent and never change, so they run once per brand per
+# process (a restart re-checks), the same as intent_engine's scoring schema.
+_schema_lock = threading.Lock()
+_schema_ensured_brands: Set[int] = set()
 
 
 # ---------------------------
@@ -588,7 +703,7 @@ def _upsert_rollup_rows(
 # ---------------------------
 # Rollup 1: intent_daily_summary
 # ---------------------------
-def _rollup_intent_daily_summary(cursor, connection, dates: List[date]) -> Dict[str, int]:
+def _rollup_intent_daily_summary(cursor, connection, dates: List[date], source: Optional[_Source] = None) -> Dict[str, int]:
     started_at = time.monotonic()
     range_start, range_end = _window_bounds(dates)
 
@@ -685,12 +800,12 @@ def _rollup_intent_daily_summary(cursor, connection, dates: List[date]) -> Dict[
 # ---------------------------
 # Rollup 2: page_behavior_daily
 # ---------------------------
-def _rollup_page_behavior_daily(cursor, connection, dates: List[date]) -> Dict[str, int]:
+def _rollup_page_behavior_daily(cursor, connection, dates: List[date], source: Optional[_Source] = None) -> Dict[str, int]:
     started_at = time.monotonic()
     range_start, range_end = _window_bounds(dates)
 
     cursor.execute(
-        """
+        _src("""
         SELECT
             DATE(occurred_at) AS d,
             SUBSTRING_INDEX(SUBSTRING_INDEX(url, '?', 1), '#', 1) AS raw_path,
@@ -704,13 +819,13 @@ def _rollup_page_behavior_daily(cursor, connection, dates: List[date]) -> Dict[s
         FROM behavioral_events
         WHERE occurred_at >= %s AND occurred_at < %s AND url IS NOT NULL AND url <> ''
         GROUP BY DATE(occurred_at), raw_path
-        """,
+        """, source),
         (range_start, range_end),
     )
     behavioral_rows = cursor.fetchall()
 
     cursor.execute(
-        """
+        _src("""
         SELECT
             DATE(occurred_at) AS d,
             SUBSTRING_INDEX(SUBSTRING_INDEX(url, '?', 1), '#', 1) AS raw_path,
@@ -720,7 +835,7 @@ def _rollup_page_behavior_daily(cursor, connection, dates: List[date]) -> Dict[s
         FROM click_events
         WHERE occurred_at >= %s AND occurred_at < %s
         GROUP BY DATE(occurred_at), raw_path
-        """,
+        """, source),
         (range_start, range_end),
     )
     click_rows = cursor.fetchall()
@@ -815,12 +930,12 @@ def _rollup_page_behavior_daily(cursor, connection, dates: List[date]) -> Dict[s
 # ---------------------------
 # Rollup 3: click_behavior_daily
 # ---------------------------
-def _rollup_click_behavior_daily(cursor, connection, dates: List[date]) -> Dict[str, int]:
+def _rollup_click_behavior_daily(cursor, connection, dates: List[date], source: Optional[_Source] = None) -> Dict[str, int]:
     started_at = time.monotonic()
     range_start, range_end = _window_bounds(dates)
 
     cursor.execute(
-        """
+        _src("""
         SELECT
             DATE(occurred_at) AS d,
             SUBSTRING_INDEX(SUBSTRING_INDEX(url, '?', 1), '#', 1) AS raw_path,
@@ -833,7 +948,7 @@ def _rollup_click_behavior_daily(cursor, connection, dates: List[date]) -> Dict[
         WHERE occurred_at >= %s AND occurred_at < %s
         GROUP BY DATE(occurred_at), raw_path, click_tag, click_element_id,
                  click_element_name, click_element_type, click_href, element_value
-        """,
+        """, source),
         (range_start, range_end),
     )
     grouped_rows = cursor.fetchall()
@@ -909,7 +1024,7 @@ def _rollup_click_behavior_daily(cursor, connection, dates: List[date]) -> Dict[
 # ---------------------------
 # Rollup 4: product_behavior_daily
 # ---------------------------
-def _rollup_product_behavior_daily(cursor, connection, dates: List[date]) -> Dict[str, int]:
+def _rollup_product_behavior_daily(cursor, connection, dates: List[date], source: Optional[_Source] = None) -> Dict[str, int]:
     started_at = time.monotonic()
     range_start, range_end = _window_bounds(dates)
 
@@ -917,7 +1032,7 @@ def _rollup_product_behavior_daily(cursor, connection, dates: List[date]) -> Dic
     # plain ID. checkout_started events instead carry the WHOLE CART as a
     # list-shaped string ("[123.0, 456.0]"), handled separately below.
     cursor.execute(
-        """
+        _src("""
         SELECT
             DATE(occurred_at) AS d,
             product_id,
@@ -932,13 +1047,13 @@ def _rollup_product_behavior_daily(cursor, connection, dates: List[date]) -> Dic
               AND product_id IS NOT NULL AND product_id <> ''
               AND LEFT(product_id, 1) <> '['
         GROUP BY DATE(occurred_at), product_id
-        """,
+        """, source),
         (range_start, range_end),
     )
     agg_rows = cursor.fetchall()
 
     cursor.execute(
-        """
+        _src("""
         SELECT
             DATE(occurred_at) AS d,
             product_id,
@@ -949,7 +1064,7 @@ def _rollup_product_behavior_daily(cursor, connection, dates: List[date]) -> Dic
               AND event_name = 'checkout_started'
               AND LEFT(product_id, 1) = '['
         GROUP BY DATE(occurred_at), product_id
-        """,
+        """, source),
         (range_start, range_end),
     )
     cart_rows = cursor.fetchall()
@@ -1052,7 +1167,7 @@ def _rollup_product_behavior_daily(cursor, connection, dates: List[date]) -> Dic
 # ---------------------------
 # Rollup 5: behavioral_path_daily
 # ---------------------------
-def _rollup_behavioral_path_daily(cursor, connection, dates: List[date]) -> Dict[str, int]:
+def _rollup_behavioral_path_daily(cursor, connection, dates: List[date], source: Optional[_Source] = None) -> Dict[str, int]:
     started_at = time.monotonic()
     total_scanned = 0
     total_generated = 0
@@ -1174,7 +1289,12 @@ def run_rollups_for_brand(
         run_started_at = time.monotonic()
         now = datetime.now(IST)
 
-        _ensure_all_rollup_tables(c, conn)
+        with _schema_lock:
+            needs_schema_check = brand_index not in _schema_ensured_brands
+        if needs_schema_check:
+            _ensure_all_rollup_tables(c, conn)
+            with _schema_lock:
+                _schema_ensured_brands.add(brand_index)
 
         dates, stored_watermark = _determine_affected_dates(c, now)
         logger.info(
@@ -1183,14 +1303,13 @@ def run_rollups_for_brand(
         )
 
         any_failed = False
-        for stage_name, stage_fn in _ROLLUP_STAGES:
-            try:
-                stage_fn(c, conn, dates)
-            except Exception as e:
-                any_failed = True
-                logger.error(
-                    "[rollup %s] brand=%s failed: %s", stage_name, brand_label, e
-                )
+        source = _prepare_source(c, conn, dates)
+        try:
+            for stage_name, stage_fn in _ROLLUP_STAGES:
+                if not _run_stage(stage_name, stage_fn, c, conn, dates, source, brand_label):
+                    any_failed = True
+        finally:
+            _release_source(c, conn, source)
 
         if any_failed:
             logger.info(

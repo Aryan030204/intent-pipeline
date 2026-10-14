@@ -51,6 +51,7 @@ from pipeline.intent_kafka_contract import (
     parse_record,
 )
 from pipeline.intent_kafka_ordering import DEFAULT_SLACK_MS, WATERMARK_STALENESS_MARGIN_MS, OrderingBuffer
+from pipeline.intent_kafka_bulk import apply_batch_fast
 from pipeline.intent_kafka_writer import BrandResult, WorkItem, apply_batch
 from pipeline.intent_session_state import DEFAULT_SESSION_TIMEOUT_S
 from pipeline.state import logger
@@ -76,6 +77,8 @@ class ConsumerConfig:
     order_slack_s: float = DEFAULT_SLACK_MS / 1000
     order_buffer_max: int = 2000
     stall_timeout_s: float = 60.0            # a cycle that makes no progress for this long gives up
+    write_mode: str = "safe"                 # INTENT_WRITE_MODE: safe = per-message writer, batch = bulk writer
+    fast_path_brands: Tuple[str, ...] = ()   # INTENT_FAST_PATH_BRANDS: limit batch mode to these brands (empty = all)
 
     def kafka_settings(self, client_id: str) -> Dict[str, Any]:
         """librdkafka settings. Partitions are assigned by hand (no group membership, no rebalancing);
@@ -384,8 +387,9 @@ class IntentIngestor:
         for brand_index, items in work.items():
             brand = brand_of_index[brand_index]
             try:
+                write = apply_batch_fast if self._use_fast_path(brand) else apply_batch
                 with self.db.transaction(brand_index) as store:
-                    result: BrandResult = apply_batch(store, items, self.cfg.session_timeout_s)
+                    result: BrandResult = write(store, items, self.cfg.session_timeout_s)
             except Exception as exc:  # transaction rolled back by the provider
                 self.stats["txn_failures"] += 1
                 logger.error(
@@ -409,8 +413,9 @@ class IntentIngestor:
                 self.stats[key] += value
             logger.info(
                 f"[intent-kafka] category=batch_committed name={self.name} brand={brand} "
-                f"records={len(items)} counts={result.counts()} partitions={self._describe(items)}"
+                f"records={len(items)} path={result.path} counts={result.counts()} partitions={self._describe(items)}"
             )
+            self.stats[f"path_{result.path}"] += 1
 
         for ref in self._send_to_dlq(dlq_entries):
             resolved.add(ref)
@@ -418,6 +423,9 @@ class IntentIngestor:
 
         self.last_resolved = resolved
         return self._commit_offsets(order, resolved, started)
+
+    def _use_fast_path(self, brand: str) -> bool:
+        return self.cfg.write_mode == "batch" and (not self.cfg.fast_path_brands or brand in self.cfg.fast_path_brands)
 
     @staticmethod
     def _describe(items: List[WorkItem]) -> List[str]:

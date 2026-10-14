@@ -187,6 +187,55 @@ def _load_cursor(row) -> ActorCursor:
     )
 
 
+# ---------------- bulk statements (the fast path, pipeline/intent_kafka_bulk.py) ----------------
+# One statement carries many rows, so a batch costs a handful of round trips instead of several per
+# event. Statements are bounded in rows and bytes so they stay far below max_allowed_packet.
+BULK_MAX_ROWS = 200
+BULK_MAX_BYTES = 1_000_000
+LOOKUP_IDS_PER_QUERY = 1000
+LOOKUP_PAIRS_PER_QUERY = 500
+LOCK_ACTORS_PER_QUERY = 500
+
+EVENT_TAIL = "ON DUPLICATE KEY UPDATE event_id = event_id"
+ATC_TAIL = "ON DUPLICATE KEY UPDATE session_id = session_id"
+SESSION_TAIL = "ON DUPLICATE KEY UPDATE " + ", ".join(f"{c} = VALUES({c})" for c in _INTENT_SESSIONS_UPDATE_COLUMNS)
+CURSOR_TAIL = "ON DUPLICATE KEY UPDATE " + ", ".join(f"{c} = VALUES({c})" for c in CURSOR_COLUMNS if c != "actor_id")
+CURSOR_CLAIM_TAIL = "ON DUPLICATE KEY UPDATE actor_id = actor_id"
+# Same placeholder row as CURSOR_CLAIM_SQL: only the actor id is a parameter.
+CURSOR_CLAIM_ROW = "(%s, '', '1970-01-01 00:00:01', '1970-01-01 00:00:01', NULL, '{}')"
+
+
+def _row_bytes(row) -> int:
+    return sum(len(v) if isinstance(v, (str, bytes)) else 8 for v in row)
+
+
+def bulk_chunks(rows):
+    """Splits rows into statements of at most BULK_MAX_ROWS rows and about BULK_MAX_BYTES of data."""
+    chunk, size = [], 0
+    for row in rows:
+        row_size = _row_bytes(row)
+        if chunk and (len(chunk) >= BULK_MAX_ROWS or size + row_size > BULK_MAX_BYTES):
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(row)
+        size += row_size
+    if chunk:
+        yield chunk
+
+
+def bulk_insert_sql(table: str, columns: Sequence[str], tail: str, rows: int, row_sql: Optional[str] = None) -> str:
+    one = row_sql or "(" + ", ".join(["%s"] * len(columns)) + ")"
+    return f"INSERT INTO {table} ({', '.join(columns)}) VALUES {', '.join([one] * rows)} {tail}"
+
+
+def _flatten(rows) -> tuple:
+    return tuple(value for row in rows for value in row)
+
+
+_EVENT_TABLES = {"event": ("behavioral_events", _BEHAVIORAL_UPSERT_COLUMNS),
+                 "click": ("click_events", _CLICK_EVENTS_UPSERT_COLUMNS)}
+
+
 class MySqlIntentStore:
     """One brand database inside one open transaction. The caller commits or rolls back."""
 
@@ -239,6 +288,72 @@ class MySqlIntentStore:
     def upsert_session(self, row: tuple) -> None:
         self.cursor.execute(SESSION_UPSERT_SQL, row)
 
+    # ---- bulk operations used by the fast path ----
+
+    def lock_cursors(self, actor_ids: Sequence[str]) -> Dict[str, Optional[ActorCursor]]:
+        """Claims (placeholder rows, see CURSOR_CLAIM_SQL) and locks the cursor rows of all the actors, in
+        sorted order, in two statements per 500 actors. Keyed by the actor id lower-cased, because MySQL's
+        collation matches keys case-insensitively. A placeholder reads back as None (no session yet)."""
+        out: Dict[str, Optional[ActorCursor]] = {}
+        ids = sorted(actor_ids)
+        columns = ", ".join(CURSOR_COLUMNS)
+        for start in range(0, len(ids), LOCK_ACTORS_PER_QUERY):
+            part = ids[start:start + LOCK_ACTORS_PER_QUERY]
+            self.cursor.execute(
+                bulk_insert_sql(CURSOR_TABLE, CURSOR_COLUMNS, CURSOR_CLAIM_TAIL, len(part), CURSOR_CLAIM_ROW), tuple(part))
+            self.cursor.execute(
+                f"SELECT {columns} FROM {CURSOR_TABLE} WHERE actor_id IN ({', '.join(['%s'] * len(part))}) "
+                f"ORDER BY actor_id FOR UPDATE", tuple(part))
+            for row in self.cursor.fetchall():  # fully consumed before the next statement
+                cursor = _load_cursor(row)
+                out[cursor.actor_id.casefold()] = cursor if cursor.session_id else None
+        missing = [a for a in ids if a.casefold() not in out]
+        if missing:  # cannot happen after the claim; fail loudly rather than start a second session
+            raise RuntimeError(f"cursor rows vanished after they were claimed: {missing[:3]}")
+        return out
+
+    def existing_event_ids(self, kind: str, event_ids: Sequence[str]) -> Set[str]:
+        table, _columns = _EVENT_TABLES[kind]
+        found: Set[str] = set()
+        ids = list(event_ids)
+        for start in range(0, len(ids), LOOKUP_IDS_PER_QUERY):
+            part = ids[start:start + LOOKUP_IDS_PER_QUERY]
+            self.cursor.execute(
+                f"SELECT event_id FROM {table} WHERE event_id IN ({', '.join(['%s'] * len(part))})", tuple(part))
+            found.update(_cell(row, 0, "event_id") for row in self.cursor.fetchall())
+        return found
+
+    def existing_atc(self, pairs: Sequence[Tuple[str, str]]) -> Set[Tuple[str, str]]:
+        found: Set[Tuple[str, str]] = set()
+        items = list(pairs)
+        for start in range(0, len(items), LOOKUP_PAIRS_PER_QUERY):
+            part = items[start:start + LOOKUP_PAIRS_PER_QUERY]
+            self.cursor.execute(
+                f"SELECT session_id, product_id FROM {ATC_TABLE} "
+                f"WHERE (session_id, product_id) IN ({', '.join(['(%s, %s)'] * len(part))})", _flatten(part))
+            found.update((_cell(r, 0, "session_id"), _cell(r, 1, "product_id")) for r in self.cursor.fetchall())
+        return found
+
+    def insert_events(self, kind: str, rows: Sequence[tuple]) -> None:
+        table, columns = _EVENT_TABLES[kind]
+        for chunk in bulk_chunks(rows):
+            self.cursor.execute(bulk_insert_sql(table, columns, EVENT_TAIL, len(chunk)), _flatten(chunk))
+
+    def insert_claims(self, pairs: Sequence[Tuple[str, str]]) -> None:
+        for chunk in bulk_chunks(pairs):
+            self.cursor.execute(bulk_insert_sql(ATC_TABLE, ("session_id", "product_id"), ATC_TAIL, len(chunk)), _flatten(chunk))
+
+    def upsert_sessions(self, rows: Sequence[tuple]) -> None:
+        for chunk in bulk_chunks(rows):
+            self.cursor.execute(
+                bulk_insert_sql("intent_sessions", _INTENT_SESSIONS_UPSERT_COLUMNS, SESSION_TAIL, len(chunk)), _flatten(chunk))
+
+    def save_cursors(self, cursors: Sequence[ActorCursor]) -> None:
+        rows = [(c.actor_id, c.session_id, c.session_start, c.last_event_at, c.last_event_id, json.dumps(c.events_seq))
+                for c in cursors]
+        for chunk in bulk_chunks(rows):
+            self.cursor.execute(bulk_insert_sql(CURSOR_TABLE, CURSOR_COLUMNS, CURSOR_TAIL, len(chunk)), _flatten(chunk))
+
 
 class InMemoryIntentStore:
     """Same unique keys, savepoint rollback and lock-order record as MySqlIntentStore, for
@@ -286,3 +401,37 @@ class InMemoryIntentStore:
 
     def upsert_session(self, row: tuple) -> None:
         self.sessions = [r for r in self.sessions if r[0] != row[0]] + [row]
+
+    # ---- bulk operations used by the fast path ----
+
+    def lock_cursors(self, actor_ids: Sequence[str]) -> Dict[str, Optional[ActorCursor]]:
+        out: Dict[str, Optional[ActorCursor]] = {}
+        for actor_id in sorted(actor_ids):
+            self.locked_actors.append(actor_id)
+            out[actor_id.casefold()] = self.cursors.get(actor_id)
+        return out
+
+    def existing_event_ids(self, kind: str, event_ids: Sequence[str]) -> Set[str]:
+        target = self.events if kind == "event" else self.clicks
+        return {i for i in event_ids if i in target}
+
+    def existing_atc(self, pairs: Sequence[Tuple[str, str]]) -> Set[Tuple[str, str]]:
+        return {p for p in pairs if p in self.atc}
+
+    def insert_events(self, kind: str, rows: Sequence[tuple]) -> None:
+        target = self.events if kind == "event" else self.clicks
+        for row in rows:
+            if row[0] in self.fail_on:
+                raise self.fail_on[row[0]]
+            target.setdefault(row[0], row)
+
+    def insert_claims(self, pairs: Sequence[Tuple[str, str]]) -> None:
+        self.atc.update(pairs)
+
+    def upsert_sessions(self, rows: Sequence[tuple]) -> None:
+        for row in rows:
+            self.upsert_session(row)
+
+    def save_cursors(self, cursors: Sequence[ActorCursor]) -> None:
+        for cursor in cursors:
+            self.cursors[cursor.actor_id] = cursor

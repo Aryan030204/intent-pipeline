@@ -8,6 +8,8 @@ Reuses pipeline/intent_events.py's _ensure_column_exists and
 pipeline/db.py's executemany_chunked - imported, never modified.
 """
 
+import logging
+import os
 import threading
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -15,6 +17,35 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from pipeline.state import IST
 from pipeline.intent_events import _ensure_column_exists
 from pipeline.db import executemany_chunked
+
+_log = logging.getLogger("intent_pipeline")
+
+# The batched statements below are new SQL. If MySQL rejects one (a syntax, collation or type problem) the
+# original statement is used instead, so scoring keeps working; INTENT_SCORING_MODE=legacy forces the
+# originals. Connection loss, deadlocks and the like are not SQL rejections and still propagate.
+IN_LIST_CHUNK = 1000        # ids per IN (...) list
+UPDATE_CHUNK = 500          # sessions per multi-row UPDATE
+_SQL_REJECTION_ERRNOS = {1064, 1054, 1052, 1267, 1271, 1366, 1292, 1265, 1406, 1048, 1136, 1222, 1241, 1305}
+
+
+def _legacy_forced() -> bool:
+    return os.environ.get("INTENT_SCORING_MODE", "batch").strip().lower() == "legacy"
+
+
+def _is_sql_rejection(exc: BaseException) -> bool:
+    if getattr(exc, "errno", None) in _SQL_REJECTION_ERRNOS:
+        return True
+    try:
+        from mysql.connector import errors
+
+        return isinstance(exc, (errors.ProgrammingError, errors.DataError, errors.NotSupportedError))
+    except ImportError:  # pragma: no cover
+        return False
+
+
+def _chunks(items: Sequence[Any], size: int):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 
 def _day_bounds(target_date: date) -> Tuple[datetime, datetime]:
@@ -156,7 +187,8 @@ def fetch_eligible_sessions(cursor, window_start: datetime, window_end: datetime
     return cursor.fetchall()
 
 
-def fetch_page_viewed_enrichment(cursor, session_ids: Sequence[str]) -> List[Dict[str, Any]]:
+def _legacy_fetch_page_viewed_enrichment(cursor, session_ids: Sequence[str]) -> List[Dict[str, Any]]:
+    """The original query: one row per page_viewed event, with its full url and user agent."""
     if not session_ids:
         return []
     placeholders = ", ".join(["%s"] * len(session_ids))
@@ -171,29 +203,78 @@ def fetch_page_viewed_enrichment(cursor, session_ids: Sequence[str]) -> List[Dic
     return cursor.fetchall()
 
 
+def fetch_page_viewed_enrichment(cursor, session_ids: Sequence[str]) -> List[Dict[str, Any]]:
+    """
+    One row per (session, page path) instead of one per page_viewed event: the path with its query string
+    and fragment stripped in SQL, the time it was first seen, and a user agent. That is everything
+    session_scorer._build_enrichment reads (entry page = earliest path, page types = the distinct paths,
+    user agent = any non-null one), with far fewer rows and no repeated url/user-agent text.
+    normalize_page_path strips the query and fragment itself, so a pre-stripped path normalises identically.
+    Falls back to the original query if MySQL rejects this one. Ids are sent in bounded IN lists.
+    """
+    if not session_ids:
+        return []
+    if _legacy_forced():
+        return _legacy_fetch_page_viewed_enrichment(cursor, session_ids)
+    ids = list(session_ids)
+    try:
+        rows: List[Dict[str, Any]] = []
+        for chunk in _chunks(ids, IN_LIST_CHUNK):
+            cursor.execute(
+                f"""
+                SELECT session_id,
+                       SUBSTRING_INDEX(SUBSTRING_INDEX(url, '?', 1), '#', 1) AS page_path,
+                       MIN(occurred_at) AS occurred_at,
+                       MAX(user_agent) AS user_agent
+                FROM behavioral_events
+                WHERE session_id IN ({", ".join(["%s"] * len(chunk))}) AND event_name = 'page_viewed'
+                GROUP BY session_id, page_path
+                """,
+                tuple(chunk),
+            )
+            for row in cursor.fetchall():
+                row["url"] = row.pop("page_path")
+                rows.append(row)
+        return rows
+    except Exception as exc:
+        if not _is_sql_rejection(exc):
+            raise
+        _log.warning("[intent scoring] grouped enrichment query rejected (%s: %s); using the original query",
+                     type(exc).__name__, str(exc)[:200])
+        rows = []
+        for chunk in _chunks(ids, IN_LIST_CHUNK):
+            rows.extend(_legacy_fetch_page_viewed_enrichment(cursor, chunk))
+        return rows
+
+
 def fetch_click_user_agents(cursor, session_ids: Sequence[str]) -> Dict[str, str]:
     """
     Fallback UA source for click-only sessions with zero page_viewed rows -
     only ever called on the residual subset still missing a user_agent,
-    never the full batch.
+    never the full batch. Ids are sent in bounded IN lists.
     """
     if not session_ids:
         return {}
-    placeholders = ", ".join(["%s"] * len(session_ids))
-    cursor.execute(
-        f"""
-        SELECT session_id, ANY_VALUE(user_agent) AS user_agent
-        FROM click_events
-        WHERE session_id IN ({placeholders})
-        GROUP BY session_id
-        """,
-        tuple(session_ids),
-    )
-    return {row["session_id"]: row["user_agent"] for row in cursor.fetchall() if row["user_agent"]}
+    found: Dict[str, str] = {}
+    for chunk in _chunks(list(session_ids), IN_LIST_CHUNK):
+        placeholders = ", ".join(["%s"] * len(chunk))
+        cursor.execute(
+            f"""
+            SELECT session_id, ANY_VALUE(user_agent) AS user_agent
+            FROM click_events
+            WHERE session_id IN ({placeholders})
+            GROUP BY session_id
+            """,
+            tuple(chunk),
+        )
+        found.update({row["session_id"]: row["user_agent"] for row in cursor.fetchall() if row["user_agent"]})
+    return found
 
 
-def bulk_update_scored_sessions(cursor, connection, rows: List[Tuple]) -> int:
-    """
+def _legacy_bulk_update_scored_sessions(cursor, connection, rows: List[Tuple]) -> int:
+    """The original: one UPDATE per session through executemany.
+
+    
     Plain bulk UPDATE, not INSERT-on-duplicate: this engine only ever scores
     sessions it just read from intent_sessions, so the row always pre-exists
     - an INSERT path here would risk a NOT NULL failure on columns
@@ -232,8 +313,10 @@ def bulk_update_scored_sessions(cursor, connection, rows: List[Tuple]) -> int:
     return executemany_chunked(cursor, connection, sql, rows)
 
 
-def bulk_update_excluded_sessions(cursor, connection, rows: List[Tuple]) -> int:
-    """
+def _legacy_bulk_update_excluded_sessions(cursor, connection, rows: List[Tuple]) -> int:
+    """The original: one UPDATE per session through executemany.
+
+    
     rows: (exclusion_reason, intent_scored_at, intent_score_version, session_id).
     See bulk_update_scored_sessions's docstring for why updated_at = updated_at
     is required here too - the same watermark-loop risk applies to excluded
@@ -255,6 +338,76 @@ def bulk_update_excluded_sessions(cursor, connection, rows: List[Tuple]) -> int:
         WHERE session_id = %s
     """
     return executemany_chunked(cursor, connection, sql, rows)
+
+
+def _batched_update(cursor, connection, rows: List[Tuple], columns: Tuple[str, ...], assignments: str) -> int:
+    """
+    UPDATE intent_sessions s JOIN (SELECT ... UNION ALL SELECT ...) v ON v.session_id = s.session_id SET ...
+    One statement per UPDATE_CHUNK sessions instead of one per session. The UNION ALL derived table works on
+    every MySQL version (no VALUES ROW). `s.updated_at = s.updated_at` is kept for the same reason as in the
+    original (it suppresses ON UPDATE CURRENT_TIMESTAMP, which is the scoring watermark). `columns` are the
+    row's fields in order, the session id LAST. Commits per chunk, as executemany_chunked did.
+    """
+    one_row = "SELECT " + ", ".join(["%s"] * len(columns))
+    first_row = "SELECT " + ", ".join(f"%s AS {name}" for name in columns)
+    for chunk in _chunks(rows, UPDATE_CHUNK):
+        derived = " UNION ALL ".join([first_row] + [one_row] * (len(chunk) - 1))
+        params = tuple(value for row in chunk for value in row)
+        cursor.execute(
+            f"UPDATE intent_sessions s JOIN ({derived}) v ON v.session_id = s.session_id SET {assignments}", params)
+        connection.commit()
+    return len(rows)
+
+
+def _with_original_fallback(batched, original, cursor, connection, rows, what: str) -> int:
+    if _legacy_forced():
+        return original(cursor, connection, rows)
+    try:
+        return batched(cursor, connection, rows)
+    except Exception as exc:
+        if not _is_sql_rejection(exc):
+            raise
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        _log.warning("[intent scoring] batched %s update rejected (%s: %s); using the original per-session update",
+                     what, type(exc).__name__, str(exc)[:200])
+        return original(cursor, connection, rows)
+
+
+def bulk_update_scored_sessions(cursor, connection, rows: List[Tuple]) -> int:
+    """Same contract as the original (rows end with the session_id; every column overwritten; updated_at
+    untouched), written as multi-row UPDATEs. See _legacy_bulk_update_scored_sessions for the full reasoning."""
+    if not rows:
+        return 0
+    columns = ("predictive_score", "intent_bucket", "operational_bucket", "entry_page_type", "intent_status",
+               "intent_scored_at", "intent_score_version", "session_id")
+    assignments = (
+        "s.predictive_score = v.predictive_score, s.intent_bucket = v.intent_bucket, "
+        "s.operational_bucket = v.operational_bucket, s.entry_page_type = v.entry_page_type, "
+        "s.intent_status = v.intent_status, s.intent_scored_at = v.intent_scored_at, "
+        "s.intent_score_version = v.intent_score_version, s.updated_at = s.updated_at"
+    )
+    return _with_original_fallback(
+        lambda c, conn, r: _batched_update(c, conn, r, columns, assignments),
+        _legacy_bulk_update_scored_sessions, cursor, connection, rows, "scored")
+
+
+def bulk_update_excluded_sessions(cursor, connection, rows: List[Tuple]) -> int:
+    """rows: (exclusion_reason, intent_scored_at, intent_score_version, session_id). Same contract as the original."""
+    if not rows:
+        return 0
+    columns = ("exclusion_reason", "intent_scored_at", "intent_score_version", "session_id")
+    assignments = (
+        "s.predictive_score = NULL, s.intent_bucket = NULL, s.operational_bucket = NULL, s.entry_page_type = NULL, "
+        "s.intent_status = 'excluded', s.intent_exclusion_reason = v.exclusion_reason, "
+        "s.intent_scored_at = v.intent_scored_at, s.intent_score_version = v.intent_score_version, "
+        "s.updated_at = s.updated_at"
+    )
+    return _with_original_fallback(
+        lambda c, conn, r: _batched_update(c, conn, r, columns, assignments),
+        _legacy_bulk_update_excluded_sessions, cursor, connection, rows, "excluded")
 
 
 # ---------------------------
@@ -373,19 +526,27 @@ def fetch_actor_ids_scored_on_date(cursor, target_date: date) -> List[str]:
 # Actor recompute (shared by both jobs)
 # ---------------------------
 def fetch_scored_sessions_for_actors(cursor, actor_ids: Sequence[str]) -> List[Dict[str, Any]]:
+    """
+    Callers pass sorted, unique ids. They are sent in bounded IN lists; every chunk is ordered by
+    (actor_id, predictive_score DESC) and the chunks cover disjoint, ascending actor ranges, so the
+    concatenation keeps the order actor_scorer.recompute_actors relies on (best session first per actor).
+    """
     if not actor_ids:
         return []
-    placeholders = ", ".join(["%s"] * len(actor_ids))
-    cursor.execute(
-        f"""
-        SELECT actor_id, session_id, predictive_score, intent_bucket
-        FROM intent_sessions
-        WHERE actor_id IN ({placeholders}) AND intent_status = 'scored'
-        ORDER BY actor_id, predictive_score DESC
-        """,
-        tuple(actor_ids),
-    )
-    return cursor.fetchall()
+    rows: List[Dict[str, Any]] = []
+    for chunk in _chunks(list(actor_ids), IN_LIST_CHUNK):
+        placeholders = ", ".join(["%s"] * len(chunk))
+        cursor.execute(
+            f"""
+            SELECT actor_id, session_id, predictive_score, intent_bucket
+            FROM intent_sessions
+            WHERE actor_id IN ({placeholders}) AND intent_status = 'scored'
+            ORDER BY actor_id, predictive_score DESC
+            """,
+            tuple(chunk),
+        )
+        rows.extend(cursor.fetchall())
+    return rows
 
 
 def bulk_upsert_actors(cursor, connection, rows: List[Tuple]) -> int:

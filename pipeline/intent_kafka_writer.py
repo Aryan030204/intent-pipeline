@@ -53,6 +53,7 @@ class BrandResult:
     duplicates: int = 0
     atc_deduped: int = 0
     sessions_closed: int = 0
+    path: str = "safe"  # safe = per-message writer, fast = bulk writer, fallback = fast path gave way to safe
     failed: Dict[Hashable, str] = field(default_factory=dict)  # ref -> reason, data errors only
 
     def counts(self) -> Dict[str, int]:

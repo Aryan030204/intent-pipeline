@@ -109,6 +109,8 @@ if TEST_MODE:
 
 PIPELINE_AUTH_HEADER = os.environ.get("PIPELINE_AUTH_HEADER", "pipeline@nosecret123")
 SELF_RUN = os.environ.get("SELF_RUN", "true").strip().lower() == "true"
+# Minutes past the hour at which the rollup job runs (APScheduler cron "minute" field). Default: every 15 minutes.
+ROLLUP_CRON_MINUTE = os.environ.get("ROLLUP_CRON_MINUTE", "").strip() or "0,15,30,45"
 MANAGER_STARTED_ENDPOINT = os.environ.get("MANAGER_STARTED_ENDPOINT")
 MANAGER_COMPLETED_ENDPOINT = os.environ.get("MANAGER_COMPLETED_ENDPOINT")
 MANAGER_FAILED_ENDPOINT = os.environ.get("MANAGER_FAILED_ENDPOINT")
@@ -628,7 +630,7 @@ if __name__ == "__main__":
         scheduler.add_job(
             run_data_pipeline,
             "cron",
-            minute="0,15,30,45",
+            minute=ROLLUP_CRON_MINUTE,
             second=0,
             coalesce=True,
             max_instances=1,
@@ -657,9 +659,9 @@ if __name__ == "__main__":
         job = scheduler.get_job("intent_pipeline_job")
         next_run = job.next_run_time if job else None
         if next_run:
-            logger.info(f"   - Schedule: Every 15 mins (Next: {next_run.strftime('%Y-%m-%d %I:%M:%S %p %Z')})")
+            logger.info(f"   - Schedule: cron minute={ROLLUP_CRON_MINUTE} (Next: {next_run.strftime('%Y-%m-%d %I:%M:%S %p %Z')})")
         else:
-            logger.info("   - Schedule: Every 15 mins")
+            logger.info(f"   - Schedule: cron minute={ROLLUP_CRON_MINUTE}")
     else:
         logger.info("   - Schedule: MANUAL ONLY (SELF_RUN=false)")
 

@@ -460,14 +460,21 @@ def get_pipeline_metadata_timestamp(
     return default
 
 
+_UPSERT_METADATA_SQL = """
+    INSERT INTO pipeline_metadata (key_name, key_value)
+    VALUES (%s, %s)
+    ON DUPLICATE KEY UPDATE key_value = VALUES(key_value);
+"""
+
+
 def update_pipeline_metadata_timestamp(cursor, connection, key_name: str, new_timestamp: datetime):
-    ensure_pipeline_metadata_table(cursor, connection)
-    cursor.execute(
-        """
-        INSERT INTO pipeline_metadata (key_name, key_value)
-        VALUES (%s, %s)
-        ON DUPLICATE KEY UPDATE key_value = VALUES(key_value);
-    """,
-        (key_name, new_timestamp),
-    )
+    """Upserts the watermark. The table is created only if it turns out not to exist (error 1146), instead of
+    running CREATE TABLE IF NOT EXISTS before every single update."""
+    try:
+        cursor.execute(_UPSERT_METADATA_SQL, (key_name, new_timestamp))
+    except mysql.connector.Error as exc:
+        if getattr(exc, "errno", None) != 1146:
+            raise
+        ensure_pipeline_metadata_table(cursor, connection)
+        cursor.execute(_UPSERT_METADATA_SQL, (key_name, new_timestamp))
     connection.commit()
