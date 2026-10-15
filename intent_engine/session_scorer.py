@@ -100,6 +100,24 @@ def score_window_for_brand(
         )
         return set()
 
+    return score_sessions(
+        cursor, connection, sessions, now, read_cursor=read_cursor,
+        label=f"range={window_start}..{window_end}", started_at=started_at,
+    )
+
+
+def score_sessions(
+    cursor, connection, sessions: List[Dict[str, Any]], now: datetime, read_cursor=None,
+    label: str = "", started_at: float = None,
+) -> Set[str]:
+    """
+    Scores an explicit list of eligible sessions (rows shaped like fetch_eligible_sessions
+    returns) and writes the results through `cursor`. Used by the windowed scoring pass and
+    by the startup catch-up of pending sessions. Pure reads use `read_cursor` when given.
+    Returns the actor_ids touched, for actor_scorer.recompute_actors.
+    """
+    started_at = started_at if started_at is not None else time.monotonic()
+    reader = read_cursor if read_cursor is not None else cursor
     session_ids = [s["session_id"] for s in sessions]
     enrichment = _build_enrichment(reader, session_ids)
 
@@ -164,9 +182,9 @@ def score_window_for_brand(
 
     duration = time.monotonic() - started_at
     logger.info(
-        "[intent scoring] range=%s..%s duration=%.2fs sessions_loaded=%s "
+        "[intent scoring] %s duration=%.2fs sessions_loaded=%s "
         "scored=%s excluded=%s low=%s medium=%s high=%s score_version=%s",
-        window_start, window_end, duration, len(sessions), upserted, excluded_count,
+        label, duration, len(sessions), upserted, excluded_count,
         sum(1 for r in scored_rows if r[1] == "low"),
         sum(1 for r in scored_rows if r[1] == "medium"),
         sum(1 for r in scored_rows if r[1] == "high"),

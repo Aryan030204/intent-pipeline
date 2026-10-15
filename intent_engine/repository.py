@@ -187,6 +187,45 @@ def fetch_eligible_sessions(cursor, window_start: datetime, window_end: datetime
     return cursor.fetchall()
 
 
+def fetch_last_processed_updated_at(cursor) -> Optional[datetime]:
+    """updated_at (the database clock) of the most recent session the engine has already
+    processed, scored or excluded. None if it has never processed one."""
+    cursor.execute(
+        "SELECT MAX(updated_at) AS last_updated FROM intent_sessions WHERE intent_status IN ('scored', 'excluded')"
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    value = row["last_updated"] if isinstance(row, dict) else row[0]
+    return value if isinstance(value, datetime) else None
+
+
+def fetch_pending_sessions(
+    cursor, window_start: datetime, window_end: datetime, limit: int,
+    after: Optional[Tuple[datetime, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Closed sessions still `pending` with updated_at in [window_start, window_end), oldest first.
+    `after` is the (updated_at, session_id) of the last row of the previous chunk, so each chunk
+    starts where the last one ended and the loop always moves forward, whatever happens to
+    a row's status. Each row also carries updated_at, for that key."""
+    columns_sql = ", ".join(_ELIGIBLE_SESSION_COLUMNS)
+    sql = f"""
+        SELECT {columns_sql}, updated_at
+        FROM intent_sessions
+        WHERE intent_status = 'pending'
+              AND session_time_spent_ms IS NOT NULL
+              AND updated_at >= %s AND updated_at < %s
+    """
+    params: List[Any] = [window_start, window_end]
+    if after is not None:
+        sql += " AND (updated_at > %s OR (updated_at = %s AND session_id > %s))"
+        params += [after[0], after[0], after[1]]
+    sql += " ORDER BY updated_at, session_id LIMIT %s"
+    params.append(int(limit))
+    cursor.execute(sql, tuple(params))
+    return cursor.fetchall()
+
+
 def _legacy_fetch_page_viewed_enrichment(cursor, session_ids: Sequence[str]) -> List[Dict[str, Any]]:
     """The original query: one row per page_viewed event, with its full url and user agent."""
     if not session_ids:

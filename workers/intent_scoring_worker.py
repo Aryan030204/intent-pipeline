@@ -49,7 +49,9 @@ if PROJECT_ROOT not in sys.path:
 # never execute here.
 import aws_background  # noqa: F401  (see module docstring)
 
-from intent_engine.runner import run_intent_scoring_pipeline, run_intent_calibration_pipeline
+from intent_engine.runner import (
+    run_intent_scoring_catchup, run_intent_scoring_pipeline, run_intent_calibration_pipeline,
+)
 
 
 def _run_scheduled() -> None:
@@ -69,6 +71,14 @@ def _run_scheduled() -> None:
     pipeline once and exit (e.g. for a one-off/manual invocation).
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
+
+    # First, work off the sessions still pending from after the last one the engine processed,
+    # so a restart (or a period of downtime) never leaves a backlog waiting for the cron.
+    logger.info("Running intent scoring catch-up of pending sessions on startup")
+    try:
+        run_intent_scoring_catchup()
+    except Exception as e:
+        logger.error("Error in startup catch-up of pending sessions: %s", e)
 
     logger.info("Running intent scoring pipeline once immediately on startup")
     try:
