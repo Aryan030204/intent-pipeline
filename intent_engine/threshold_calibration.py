@@ -49,20 +49,27 @@ def compute_dead_click_p90(cursor, target_date: date) -> Optional[float]:
     return _percentile(rates, 90)
 
 
-def calibrate_date_for_brand(cursor, connection, target_date: date, now: datetime) -> Set[str]:
+def calibrate_date_for_brand(
+    cursor, connection, target_date: date, now: datetime, read_cursor=None,
+) -> Set[str]:
     """
     Runs the full daily calibration for one date on one brand's already-open
     cursor/connection: compute + persist thresholds, bulk-reassign that
     date's session buckets, return the actor_ids that need recomputing
     (every actor with a scored session on target_date - calibration can
     reclassify any of them, not just ones touched by new scoring activity).
+
+    `read_cursor` (optional, may be a read replica) serves the two independent bulk reads
+    that feed the thresholds. Every write, and the actor lookup that follows the writes,
+    uses `cursor`. Without it everything uses `cursor`, as before.
     """
     started_at = time.monotonic()
+    reader = read_cursor if read_cursor is not None else cursor
 
-    p90 = compute_dead_click_p90(cursor, target_date)
+    p90 = compute_dead_click_p90(reader, target_date)
 
     scores = fetch_scored_predictive_scores_for_date(
-        cursor, target_date, CALIBRATION_MAX_SESSIONS_PER_DATE
+        reader, target_date, CALIBRATION_MAX_SESSIONS_PER_DATE
     )
     scored_session_count = len(scores)
 

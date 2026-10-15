@@ -390,6 +390,119 @@ def get_db_connection(
             )
 
 
+# ---------------------------
+# Read replica
+# ---------------------------
+# DB_READ_REPLICA_HOST names a MySQL read replica of the brand databases (same credentials,
+# port, database name and TLS settings as the primary). Pure reads that do not depend on a
+# write made moments earlier use it through get_db_read_connection / get_db_read_cursor.
+# Unset, or unreachable, and those reads use the primary exactly as before, so a replica
+# outage can never stop a job. Writes, locks, FOR UPDATE reads, schema checks and anything
+# that reads its own just-written rows must keep using get_db_connection (the primary).
+_replica_checked: set = set()
+
+
+def read_replica_host() -> Optional[str]:
+    return os.environ.get("DB_READ_REPLICA_HOST", "").strip() or None
+
+
+def _read_replica_config(brand_index: int) -> Optional[Dict[str, Any]]:
+    host = read_replica_host()
+    primary = brand_db_configs.get(brand_index)
+    if not host or not primary or host.lower() == str(primary.get("host", "")).lower():
+        return None
+    config = dict(primary)
+    config["host"] = host
+    return config
+
+
+def _check_replica_connection(cnx, brand_index: int, config: Dict[str, Any]) -> None:
+    """Refuses a host that does not serve this brand's database (a wrong server would silently
+    return empty results). Logs once per brand whether the server reports read_only."""
+    cursor = cnx.cursor()
+    try:
+        cursor.execute("SELECT DATABASE(), @@read_only")
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+    database, read_only = (row[0], row[1]) if row else (None, None)
+    if str(database).lower() != str(config.get("database", "")).lower():
+        raise RuntimeError(f"replica serves database {database!r}, expected {config.get('database')!r}")
+    if brand_index not in _replica_checked:
+        _replica_checked.add(brand_index)
+        logger.info(
+            "DB_READ_REPLICA_READY brand_index=%s host=%s database=%s read_only=%s",
+            brand_index, config["host"], database, read_only,
+        )
+        if not read_only:
+            logger.warning(
+                "DB_READ_REPLICA_WRITABLE brand_index=%s host=%s reports read_only=0; check it is a replica",
+                brand_index, config["host"],
+            )
+
+
+@contextmanager
+def get_db_read_connection(brand_index: int):
+    """A connection for pure reads: the read replica when DB_READ_REPLICA_HOST is set and
+    reachable, otherwise the primary. One attempt on the replica, then the primary."""
+    replica_config = _read_replica_config(brand_index)
+    cnx = None
+    if replica_config is not None:
+        brand_name = os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}")
+        try:
+            cnx = _open_mysql_connection_once(brand_index, f"{brand_name} (read replica)", replica_config)
+            _check_replica_connection(cnx, brand_index, replica_config)
+        except Exception as exc:
+            if cnx is not None:
+                try:
+                    cnx.close()
+                except Exception:
+                    pass
+                _metric_dec("active_connector_connections")
+                cnx = None
+            logger.warning(
+                "DB_READ_REPLICA_FALLBACK brand_index=%s host=%s using the primary: %s: %s",
+                brand_index, replica_config["host"], type(exc).__name__, str(exc)[:200],
+            )
+
+    if cnx is None:
+        with get_db_connection(brand_index) as primary:
+            yield primary
+        return
+
+    try:
+        yield cnx
+    finally:
+        try:
+            try:
+                if cnx.in_transaction:
+                    cnx.rollback()
+            except Exception:
+                pass
+            cnx.close()
+        finally:
+            _metric_dec("active_connector_connections")
+            logger.info(
+                "DB_CONNECTION_CLOSED brand=%s brand_index=%s pipeline=intent_data_aggregation (read replica) thread=%s",
+                os.environ.get(f"BRAND_NAME_{brand_index}", f"Brand_{brand_index}"),
+                brand_index,
+                threading.current_thread().name,
+            )
+
+
+@contextmanager
+def get_db_read_cursor(brand_index: int, dictionary=True):
+    with get_db_read_connection(brand_index) as connection:
+        cursor = connection.cursor(dictionary=dictionary)
+        try:
+            yield cursor
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+
 @contextmanager
 def get_db_cursor(brand_index: int, dictionary=True):
     with get_db_connection(brand_index) as connection:

@@ -80,14 +80,20 @@ def _build_enrichment(cursor, session_ids: List[str]) -> Dict[str, _SessionEnric
 
 def score_window_for_brand(
     cursor, connection, window_start: datetime, window_end: datetime, now: datetime,
+    read_cursor=None,
 ) -> Set[str]:
     """
     Runs the full 2-hour scoring pass for one brand's already-open
     cursor/connection over [window_start, window_end). Returns the set of
     actor_ids touched (for the caller to pass to actor_scorer.recompute_actors).
+
+    `read_cursor` (optional) serves the pure reads: the eligible sessions, their event
+    enrichment and the thresholds. It may be a read replica. Writes always use `cursor`.
+    Without it every query uses `cursor`, as before.
     """
     started_at = time.monotonic()
-    sessions = fetch_eligible_sessions(cursor, window_start, window_end)
+    reader = read_cursor if read_cursor is not None else cursor
+    sessions = fetch_eligible_sessions(reader, window_start, window_end)
     if not sessions:
         logger.info(
             "[intent scoring] range=%s..%s: no closed eligible sessions", window_start, window_end
@@ -95,7 +101,7 @@ def score_window_for_brand(
         return set()
 
     session_ids = [s["session_id"] for s in sessions]
-    enrichment = _build_enrichment(cursor, session_ids)
+    enrichment = _build_enrichment(reader, session_ids)
 
     excluded_rows = []
     scorable_sessions = []
@@ -113,7 +119,7 @@ def score_window_for_brand(
         scorable_sessions.append(session)
 
     session_dates = list({s["session_start"].date() for s in scorable_sessions})
-    effective_thresholds = get_effective_thresholds(cursor, session_dates)
+    effective_thresholds = get_effective_thresholds(reader, session_dates)
 
     scored_rows = []
     affected_actor_ids: Set[str] = set()

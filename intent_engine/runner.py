@@ -22,7 +22,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 from pipeline.state import IST, logger, active_brand_indices
-from pipeline.db import get_db_cursor, get_pipeline_metadata_timestamp, update_pipeline_metadata_timestamp
+from pipeline.db import (
+    get_db_cursor, get_db_read_cursor, get_pipeline_metadata_timestamp, update_pipeline_metadata_timestamp,
+)
 from pipeline.intent_events import _parse_intent_db_map
 from pipeline.orchestration import _resolve_brand_index_by_db_database
 
@@ -30,6 +32,7 @@ from intent_engine.config import (
     SCORING_METADATA_KEY, SCORING_OVERLAP, SCORING_DEFAULT_LOOKBACK,
     CALIBRATION_LOOKBACK_DAYS,
 )
+from intent_engine.db_clock import db_clock_offset, read_db_now, to_db_clock
 from intent_engine.repository import _ensure_scoring_schema
 from intent_engine.session_scorer import score_window_for_brand
 from intent_engine.threshold_calibration import calibrate_date_for_brand
@@ -68,9 +71,26 @@ def _run_scoring_for_brand(brand_index: int, brand_label: str) -> None:
             else now - SCORING_DEFAULT_LOOKBACK
         )
 
-        affected_actor_ids = score_window_for_brand(
-            cursor, connection, window_start=window_start, window_end=now, now=now,
+        # `window_start`/`now` are IST wall-clock times, but intent_sessions.updated_at is
+        # stamped by the database server's own clock (UTC on RDS). Express the window in that
+        # clock, or it lands hours in the future and matches nothing (see db_clock.py).
+        db_now = read_db_now(cursor)
+        offset = db_clock_offset(db_now, now) if db_now is not None else timedelta(0)
+        db_window_start, db_window_end = to_db_clock(window_start, offset), to_db_clock(now, offset)
+        logger.info(
+            "[intent scoring] brand=%s window ist=%s..%s db_clock=%s..%s (db offset %s)",
+            brand_label, window_start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S"),
+            db_window_start, db_window_end, offset,
         )
+
+        # The pure reads (eligible sessions, enrichment, thresholds) go to the read replica when
+        # DB_READ_REPLICA_HOST is set; every write stays on the primary `cursor`. A session the
+        # replica has not received yet is picked up by the next run (SCORING_OVERLAP).
+        with get_db_read_cursor(brand_index) as read_cursor:
+            affected_actor_ids = score_window_for_brand(
+                cursor, connection, window_start=db_window_start, window_end=db_window_end, now=now,
+                read_cursor=read_cursor,
+            )
 
         if affected_actor_ids:
             recompute_actors(cursor, connection, affected_actor_ids, now)
@@ -118,7 +138,10 @@ def _run_calibration_for_brand(brand_index: int, brand_label: str, target_date) 
     with get_db_cursor(brand_index) as (cursor, connection):
         _ensure_scoring_schema(brand_index, cursor, connection)
         now = datetime.now(IST)
-        affected_actor_ids = calibrate_date_for_brand(cursor, connection, target_date, now)
+        with get_db_read_cursor(brand_index) as read_cursor:
+            affected_actor_ids = calibrate_date_for_brand(
+                cursor, connection, target_date, now, read_cursor=read_cursor,
+            )
         if affected_actor_ids:
             recompute_actors(cursor, connection, affected_actor_ids, now)
 
