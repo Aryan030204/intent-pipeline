@@ -42,7 +42,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Hashable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Hashable, List, Optional, Sequence, Set, Tuple
 
 from pipeline.intent_kafka_contract import (
     INTENT_TOPICS,
@@ -54,6 +54,7 @@ from pipeline.intent_kafka_ordering import DEFAULT_SLACK_MS, WATERMARK_STALENESS
 from pipeline.intent_kafka_bulk import apply_batch_fast
 from pipeline.intent_kafka_writer import BrandResult, WorkItem, apply_batch
 from pipeline.intent_session_state import DEFAULT_SESSION_TIMEOUT_S
+from pipeline.intent_session_sweep import sweep_brand
 from pipeline.state import logger
 
 DEFAULT_GROUP_ID = "intent-pipeline-workers"   # only the name offsets are committed under
@@ -79,6 +80,8 @@ class ConsumerConfig:
     stall_timeout_s: float = 60.0            # a cycle that makes no progress for this long gives up
     write_mode: str = "safe"                 # INTENT_WRITE_MODE: safe = per-message writer, batch = bulk writer
     fast_path_brands: Tuple[str, ...] = ()   # INTENT_FAST_PATH_BRANDS: limit batch mode to these brands (empty = all)
+    sweep_idle_sessions: bool = True         # INTENT_SESSION_SWEEP: close sessions whose visitor went quiet (pipeline/intent_session_sweep.py)
+    sweep_max_per_run: int = 20000           # INTENT_SWEEP_MAX_PER_RUN: sessions closed per brand per cycle
 
     def kafka_settings(self, client_id: str) -> Dict[str, Any]:
         """librdkafka settings. Partitions are assigned by hand (no group membership, no rebalancing);
@@ -131,6 +134,7 @@ class IntentIngestor:
         topic_partition_factory: Optional[Callable[..., Any]] = None,
         clock_ms: Optional[Callable[[], int]] = None,
         run_lock=None,
+        sweep_brand_indices: Sequence[int] = (),
     ) -> None:
         self.kafka_factory = kafka_factory
         self.dlq = dlq
@@ -142,7 +146,8 @@ class IntentIngestor:
         self._tp = topic_partition_factory or _confluent_topic_partition
         self.clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self.run_lock = run_lock
-        self.kafka = None                      # the consumer of the cycle in progress
+        self.sweep_brand_indices = tuple(sweep_brand_indices)
+        self.kafka = None                     # the consumer of the cycle in progress
         self._monitor = None                   # offsets-only consumer for pending_events()
         self._attempts: Dict[Hashable, int] = {}
         self.stats: Dict[str, int] = defaultdict(int)
@@ -195,6 +200,14 @@ class IntentIngestor:
             low, high = kafka.get_watermark_offsets(tp, timeout=10, cached=False)
             start = committed.get(key, OFFSET_INVALID)
             start = low if start is None or start < 0 else max(start, low)
+            if start > high:
+                # The committed offset is past the end of the log (the topic was recreated or truncated). Reading from
+                # there would find nothing, ever, and the partition would silently stall; start from the log start.
+                logger.warning(
+                    f"[intent-kafka] category=offset_beyond_log topic={key[0]} partition={key[1]} "
+                    f"committed={start} log_end={high}; reading from the start of the log ({low})"
+                )
+                start = low
             end = high
             if cutoff_ms is not None and high > start:
                 found = kafka.offsets_for_times([self._tp(key[0], key[1], cutoff_ms)], timeout=10)[0].offset
@@ -218,6 +231,7 @@ class IntentIngestor:
             ranges = {k: v for k, v in self._offset_bounds(kafka, cutoff).items() if v[1] > v[0]}
             if not ranges:
                 logger.info(f"[intent-kafka] category=cycle_empty trigger={reason} nothing older than the slack is waiting")
+                self._sweep()
                 return CycleResult(reason, "empty", seconds=time.monotonic() - started)
             total = sum(end - start for start, end in ranges.values())
             logger.info(
@@ -225,6 +239,8 @@ class IntentIngestor:
                 f"ranges={ {f'{t}[{p}]': f'{s}-{e - 1}' for (t, p), (s, e) in sorted(ranges.items())} }"
             )
             status, detail = self._drain(kafka, ranges)
+            if status == "done":
+                self._sweep()
             counters = {k: self.stats[k] - before.get(k, 0) for k in self.stats if self.stats[k] != before.get(k, 0)}
             elapsed = time.monotonic() - started
             logger.info(f"[intent-kafka] category=cycle_finished trigger={reason} status={status} "
@@ -245,6 +261,28 @@ class IntentIngestor:
                     pass
             if self.run_lock is not None:
                 self.run_lock.release()
+
+    def _sweep(self) -> None:
+        """Closes sessions whose visitor has gone quiet, so one-page bounces and other static visits get an
+        intent_sessions row. Runs under the cycle's run lock, only after a cycle that read everything it
+        meant to. It never fails the cycle: an error is logged and the next cycle tries again."""
+        if not self.cfg.sweep_idle_sessions:
+            return
+        for brand_index in self.sweep_brand_indices:
+            if self.stop_event.is_set():
+                return
+            try:
+                result = sweep_brand(self.db, brand_index, self.cfg.session_timeout_s,
+                                     max_total=self.cfg.sweep_max_per_run, should_stop=self.stop_event.is_set)
+            except Exception as exc:
+                self.stats["sweep_failures"] += 1
+                logger.warning(f"[intent-kafka] category=sweep_failed brand_index={brand_index} "
+                               f"{type(exc).__name__}: {str(exc)[:300]}")
+                continue
+            self.stats["sessions_swept"] += result.closed
+            if result.closed or result.skipped:
+                logger.info(f"[intent-kafka] category=sessions_swept brand_index={brand_index} closed={result.closed} "
+                            f"skipped={result.skipped} idle_before={result.cutoff}")
 
     def _drain(self, kafka, ranges) -> Tuple[str, str]:
         kafka.assign([self._tp(t, p, start) for (t, p), (start, _end) in sorted(ranges.items())])

@@ -359,6 +359,36 @@ def _run_stage(stage_name, stage_fn, cursor, connection, dates, source: _Source,
 _schema_lock = threading.Lock()
 _schema_ensured_brands: Set[int] = set()
 
+# Skip-when-unchanged. Every run recomputes whole days, so a brand that received nothing since the last full run
+# would read and rewrite identical numbers. The cheap test is the newest row id of the three source tables
+# (MAX(id) on an AUTO_INCREMENT primary key reads one index entry): ids only grow, a burned id from a duplicate
+# insert is not a row, and a new event, click or closed session always raises its table's maximum. The signature
+# of the last fully successful run is remembered per brand in this process only, so a restart always runs once.
+_last_run: Dict[int, Tuple[Tuple[date, ...], Tuple]] = {}
+_SIGNATURE_SQL = (
+    "SELECT (SELECT MAX(id) FROM behavioral_events) AS events, "
+    "(SELECT MAX(id) FROM click_events) AS clicks, "
+    "(SELECT MAX(id) FROM intent_sessions) AS sessions"
+)
+
+
+def _skip_unchanged_enabled() -> bool:
+    return os.environ.get("INTENT_ROLLUP_SKIP_UNCHANGED", "on").strip().lower() not in ("off", "false", "0", "no")
+
+
+def _change_signature(cursor) -> Optional[Tuple]:
+    """Newest event, click and session row ids, or None when they cannot be read (then the run is never skipped)."""
+    try:
+        cursor.execute(_SIGNATURE_SQL)
+        rows = cursor.fetchall()
+        if not rows:
+            return None
+        row = rows[0]
+        return tuple(row[k] for k in ("events", "clicks", "sessions")) if isinstance(row, dict) else tuple(row)
+    except Exception as exc:
+        logger.debug("[rollup] change signature unavailable (%s); running in full", exc)
+        return None
+
 
 # ---------------------------
 # Shared normalization helpers
@@ -1302,6 +1332,21 @@ def run_rollups_for_brand(
             brand_label, stored_watermark, len(dates), dates[0], dates[-1],
         )
 
+        signature = _change_signature(c) if _skip_unchanged_enabled() else None
+        if (
+            signature is not None
+            and stored_watermark is not None
+            and _last_run.get(brand_index) == (tuple(dates), signature)
+        ):
+            # Nothing was added since a run that completed over these same dates, so the tables are already
+            # right. The watermark still advances: the window is then measured from now, not from a stale mark.
+            update_pipeline_metadata_timestamp(c, conn, ROLLUP_METADATA_KEY, now)
+            logger.info(
+                "[rollup] brand=%s unchanged since the last complete run (dates=%s..%s); skipped, watermark advanced to %s",
+                brand_label, dates[0], dates[-1], now,
+            )
+            return
+
         any_failed = False
         source = _prepare_source(c, conn, dates)
         try:
@@ -1312,12 +1357,17 @@ def run_rollups_for_brand(
             _release_source(c, conn, source)
 
         if any_failed:
+            _last_run.pop(brand_index, None)
             logger.info(
                 "[rollup] brand=%s watermark NOT advanced due to a stage failure "
                 "(window will be retried next run)", brand_label,
             )
         else:
             update_pipeline_metadata_timestamp(c, conn, ROLLUP_METADATA_KEY, now)
+            if signature is not None:   # taken before the stages ran, so anything written meanwhile forces the next run
+                _last_run[brand_index] = (tuple(dates), signature)
+            else:
+                _last_run.pop(brand_index, None)
             logger.info(
                 "[rollup] brand=%s watermark advanced to %s (duration=%.2fs)",
                 brand_label, now, time.monotonic() - run_started_at,

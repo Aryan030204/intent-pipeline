@@ -18,6 +18,7 @@ Write semantics (verified against a real MySQL in tests/test_intent_kafka_mysql.
 import copy
 import json
 import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pipeline.intent_events import (
@@ -354,6 +355,32 @@ class MySqlIntentStore:
         for chunk in bulk_chunks(rows):
             self.cursor.execute(bulk_insert_sql(CURSOR_TABLE, CURSOR_COLUMNS, CURSOR_TAIL, len(chunk)), _flatten(chunk))
 
+    # ---- idle-session sweep (pipeline/intent_session_sweep.py) ----
+
+    def latest_cursor_time(self) -> Optional[datetime]:
+        """The newest last_event_at of any open session: how far this brand's ingestion has got, in the
+        store-local clock the events carry. Placeholder rows (session_id '') do not count."""
+        self.cursor.execute(f"SELECT MAX(last_event_at) AS latest FROM {CURSOR_TABLE} WHERE session_id <> ''")
+        rows = self.cursor.fetchall()
+        return _cell(rows[0], 0, "latest") if rows else None
+
+    def idle_cursors(self, before: datetime, limit: int) -> List[ActorCursor]:
+        """Open sessions whose last event is older than `before`, oldest first. A plain read, no row locks:
+        the run lock makes the worker the only writer of this table, and the delete below re-checks the row."""
+        self.cursor.execute(
+            f"SELECT {', '.join(CURSOR_COLUMNS)} FROM {CURSOR_TABLE} "
+            f"WHERE session_id <> '' AND last_event_at < %s ORDER BY last_event_at LIMIT %s", (before, limit))
+        return [_load_cursor(row) for row in self.cursor.fetchall()]
+
+    def delete_cursors(self, cursors: Sequence[ActorCursor]) -> None:
+        """Removes exactly these open sessions (matched on actor and session id, so a cursor that has moved
+        on to a newer session is left alone). The actor's next event then starts a new session."""
+        for start in range(0, len(cursors), LOOKUP_PAIRS_PER_QUERY):
+            part = cursors[start:start + LOOKUP_PAIRS_PER_QUERY]
+            self.cursor.execute(
+                f"DELETE FROM {CURSOR_TABLE} WHERE (actor_id, session_id) IN ({', '.join(['(%s, %s)'] * len(part))})",
+                _flatten([(c.actor_id, c.session_id) for c in part]))
+
 
 class InMemoryIntentStore:
     """Same unique keys, savepoint rollback and lock-order record as MySqlIntentStore, for
@@ -435,3 +462,18 @@ class InMemoryIntentStore:
     def save_cursors(self, cursors: Sequence[ActorCursor]) -> None:
         for cursor in cursors:
             self.cursors[cursor.actor_id] = cursor
+
+    # ---- idle-session sweep ----
+
+    def latest_cursor_time(self) -> Optional[datetime]:
+        return max((c.last_event_at for c in self.cursors.values()), default=None)
+
+    def idle_cursors(self, before: datetime, limit: int) -> List[ActorCursor]:
+        idle = [c for c in self.cursors.values() if c.last_event_at < before]
+        return sorted(idle, key=lambda c: c.last_event_at)[:limit]
+
+    def delete_cursors(self, cursors: Sequence[ActorCursor]) -> None:
+        for cursor in cursors:
+            current = self.cursors.get(cursor.actor_id)
+            if current is not None and current.session_id == cursor.session_id:
+                del self.cursors[cursor.actor_id]

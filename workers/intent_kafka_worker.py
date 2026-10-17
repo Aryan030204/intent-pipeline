@@ -98,6 +98,8 @@ def config_from_env() -> ConsumerConfig:
         order_buffer_max=_env_int("INTENT_KAFKA_ORDER_BUFFER_MAX", 2000),
         write_mode=_env_write_mode(),
         fast_path_brands=tuple(b.strip() for b in os.environ.get("INTENT_FAST_PATH_BRANDS", "").split(",") if b.strip()),
+        sweep_idle_sessions=os.environ.get("INTENT_SESSION_SWEEP", "on").strip().lower() not in ("off", "false", "0", "no"),
+        sweep_max_per_run=_env_int("INTENT_SWEEP_MAX_PER_RUN", 20000),
     )
 
 
@@ -297,6 +299,7 @@ def main() -> None:
         config,
         stop_event,
         run_lock=RunLock(get_db_connection, min(brands.values()), f"intent-kafka:{config.group_id}"),
+        sweep_brand_indices=sorted(set(brands.values())),
     )
     controller = CycleController(ingestor, config, stop_event)
     scheduler = build_scheduler(controller, config)
@@ -315,7 +318,8 @@ def main() -> None:
         f"[intent-kafka] starting brokers={config.bootstrap_servers} topics={list(config.topics)} dlq={config.dlq_topic} "
         f"batch={config.events_batch} schedule=every {config.run_every_minutes:g} min "
         f"batch_check=every {config.check_interval_s:g}s slack={config.order_slack_s:g}s "
-        f"write_mode={config.write_mode} fast_path_brands={list(config.fast_path_brands) or 'all'}"
+        f"write_mode={config.write_mode} fast_path_brands={list(config.fast_path_brands) or 'all'} "
+        f"session_sweep={'on' if config.sweep_idle_sessions else 'off'}"
     )
     try:
         scheduler.start()                       # blocks until request_stop
