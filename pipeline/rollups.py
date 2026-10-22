@@ -106,6 +106,9 @@ def _ensure_intent_daily_summary_table(cursor, connection) -> None:
         """
     )
     connection.commit()
+    # Added after the table first shipped (CREATE TABLE IF NOT EXISTS will not add it to an existing table).
+    # Distinct sessions that had any event that day, closed or not: what Shopify and Clarity count as sessions.
+    _ensure_column_exists(cursor, connection, "intent_daily_summary", "sessions_started", "INT UNSIGNED NULL")
 
 
 def _ensure_page_behavior_daily_table(cursor, connection) -> None:
@@ -765,15 +768,36 @@ def _rollup_intent_daily_summary(cursor, connection, dates: List[date], source: 
     agg_rows = cursor.fetchall()
     scanned = sum(r["sessions"] for r in agg_rows) if agg_rows else 0
 
+    # Sessions that started that day, counted from the events themselves: a session exists from its first
+    # event, but intent_sessions only gets its row when the visitor comes back after the timeout, so the
+    # closed-session count above misses every visit that was never followed by another.
+    cursor.execute(
+        _src("""
+        SELECT DATE(occurred_at) AS d, COUNT(DISTINCT session_id) AS sessions_started
+        FROM behavioral_events
+        WHERE occurred_at >= %s AND occurred_at < %s AND session_id IS NOT NULL AND session_id <> ''
+        GROUP BY DATE(occurred_at)
+        """, source),
+        (range_start, range_end),
+    )
+    started_by_date = {r["d"]: int(r["sessions_started"] or 0) for r in cursor.fetchall()}
+
     by_date = {r["d"]: r for r in agg_rows}
     rows: List[Tuple] = []
     computed_keys_by_date: Dict[date, Set[Tuple]] = {}
 
     for target_date in dates:
         r = by_date.get(target_date)
-        if r is None:
+        started = started_by_date.get(target_date)
+        if r is None and started is None:
             computed_keys_by_date[target_date] = set()
             continue
+        if r is None:
+            # Events exist but no session has closed yet (typical for today): keep the started count.
+            r = {k: 0 for k in ("sessions", "unique_actors", "total_events", "page_views", "product_views", "clicks",
+                                "useful_clicks", "dead_clicks", "add_to_carts", "checkout_starts", "scroll_events")}
+            r.update(avg_session_time_ms=None, avg_events_per_session=None,
+                     avg_product_views_per_session=None, avg_clicks_per_session=None)
         useful_click_rate = _safe_div(r["useful_clicks"], r["clicks"])
         dead_click_rate = _safe_div(r["dead_clicks"], r["clicks"])
         rows.append((
@@ -782,7 +806,7 @@ def _rollup_intent_daily_summary(cursor, connection, dates: List[date], source: 
             r["dead_clicks"], r["add_to_carts"], r["checkout_starts"], r["scroll_events"],
             r["avg_session_time_ms"], r["avg_events_per_session"],
             r["avg_product_views_per_session"], r["avg_clicks_per_session"],
-            useful_click_rate, dead_click_rate,
+            useful_click_rate, dead_click_rate, started,
         ))
         computed_keys_by_date[target_date] = {(target_date,)}
 
@@ -792,8 +816,8 @@ def _rollup_intent_daily_summary(cursor, connection, dates: List[date], source: 
             product_views, clicks, useful_clicks, dead_clicks, add_to_carts,
             checkout_starts, scroll_events, avg_session_time_ms,
             avg_events_per_session, avg_product_views_per_session,
-            avg_clicks_per_session, useful_click_rate, dead_click_rate
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            avg_clicks_per_session, useful_click_rate, dead_click_rate, sessions_started
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             sessions = VALUES(sessions),
             unique_actors = VALUES(unique_actors),
@@ -811,7 +835,8 @@ def _rollup_intent_daily_summary(cursor, connection, dates: List[date], source: 
             avg_product_views_per_session = VALUES(avg_product_views_per_session),
             avg_clicks_per_session = VALUES(avg_clicks_per_session),
             useful_click_rate = VALUES(useful_click_rate),
-            dead_click_rate = VALUES(dead_click_rate)
+            dead_click_rate = VALUES(dead_click_rate),
+            sessions_started = VALUES(sessions_started)
     """
     upserted, deleted = _upsert_rollup_rows(
         cursor, connection, "intent_daily_summary", insert_sql, rows,
