@@ -78,6 +78,22 @@ def test_recent_sessions_are_left_open():
     assert set(store.cursors) == {"a", "b"} and store.sessions == []
 
 
+def test_one_bogus_future_timestamp_does_not_make_live_sessions_look_idle():
+    from datetime import datetime
+
+    store = InMemoryIntentStore()
+    _ingest(store, value("live-1", 0, actor="live"), value("future-1", 5, actor="bogus"))
+    # an event stamped years ahead, as a client with a wrong date would send
+    store.cursors["bogus"] = store.cursors["bogus"].__class__(
+        actor_id="bogus", session_id=store.cursors["bogus"].session_id, session_start=datetime(2040, 1, 1, 1, 5),
+        last_event_at=datetime(2040, 1, 1, 1, 5), last_event_id="x", events_seq={"1": {}})
+
+    # the newest believable time is the live visitor's, so nothing is idle and nothing is closed early
+    assert store.latest_cursor_time() == store.cursors["live"].last_event_at
+    assert sweep_brand(_db(store), 1, TIMEOUT).closed == 0
+    assert "live" in store.cursors
+
+
 def test_nothing_ingested_means_nothing_to_sweep():
     assert sweep_brand(_db(InMemoryIntentStore()), 1, TIMEOUT).closed == 0
     assert sweep_cutoff(None, TIMEOUT) is None

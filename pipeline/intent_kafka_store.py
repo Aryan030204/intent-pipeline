@@ -18,7 +18,7 @@ Write semantics (verified against a real MySQL in tests/test_intent_kafka_mysql.
 import copy
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pipeline.intent_events import (
@@ -30,6 +30,9 @@ from pipeline.intent_events import (
 from pipeline.intent_session_state import ActorCursor
 
 MIGRATION_FILE = "migrations/001_intent_kafka_state.sql"
+# Store-local clocks are at most UTC+14. An event time further ahead than that is bad data (a client with a
+# wrong date); the idle-session sweep must not treat it as the current time.
+FUTURE_TOLERANCE_HOURS = 14
 CURSOR_TABLE = "intent_actor_cursors"
 ATC_TABLE = "intent_atc_dedupe"
 CURSOR_COLUMNS = ("actor_id", "session_id", "session_start", "last_event_at", "last_event_id", "events_seq")
@@ -359,8 +362,12 @@ class MySqlIntentStore:
 
     def latest_cursor_time(self) -> Optional[datetime]:
         """The newest last_event_at of any open session: how far this brand's ingestion has got, in the
-        store-local clock the events carry. Placeholder rows (session_id '') do not count."""
-        self.cursor.execute(f"SELECT MAX(last_event_at) AS latest FROM {CURSOR_TABLE} WHERE session_id <> ''")
+        store-local clock the events carry. Placeholder rows (session_id '') do not count, and neither does a
+        time that no store clock can have reached (more than FUTURE_TOLERANCE_HOURS ahead of UTC): one bogus
+        future timestamp would otherwise become 'now' and make every live session look idle."""
+        self.cursor.execute(
+            f"SELECT MAX(last_event_at) AS latest FROM {CURSOR_TABLE} "
+            f"WHERE session_id <> '' AND last_event_at <= UTC_TIMESTAMP() + INTERVAL {FUTURE_TOLERANCE_HOURS} HOUR")
         rows = self.cursor.fetchall()
         return _cell(rows[0], 0, "latest") if rows else None
 
@@ -466,7 +473,8 @@ class InMemoryIntentStore:
     # ---- idle-session sweep ----
 
     def latest_cursor_time(self) -> Optional[datetime]:
-        return max((c.last_event_at for c in self.cursors.values()), default=None)
+        limit = datetime.utcnow() + timedelta(hours=FUTURE_TOLERANCE_HOURS)
+        return max((c.last_event_at for c in self.cursors.values() if c.last_event_at <= limit), default=None)
 
     def idle_cursors(self, before: datetime, limit: int) -> List[ActorCursor]:
         idle = [c for c in self.cursors.values() if c.last_event_at < before]
