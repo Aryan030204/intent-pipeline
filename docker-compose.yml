@@ -11,6 +11,17 @@ services:
     env_file:
       - .env
     restart: always
+    # Resource isolation for the shared 4 GiB host: no swap spill (memswap_limit == mem_limit),
+    # a CPU ceiling and a PID cap.
+    mem_limit: ${INTENT_AGGREGATION_MEM_LIMIT:-768m}
+    memswap_limit: ${INTENT_AGGREGATION_MEM_LIMIT:-768m}
+    cpus: ${INTENT_AGGREGATION_CPUS:-1.0}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - pipeline-net
     extra_hosts:
@@ -23,7 +34,19 @@ services:
     container_name: intent-scoring-worker
     env_file:
       - .env
+    environment:
+      # Catch-up + scoring + calibration at startup wait this long (see workers/intent_scoring_worker.py).
+      INTENT_SCORING_STARTUP_DELAY_S: ${INTENT_SCORING_STARTUP_DELAY_S:-210}
     restart: always
+    mem_limit: ${INTENT_SCORING_WORKER_MEM_LIMIT:-768m}
+    memswap_limit: ${INTENT_SCORING_WORKER_MEM_LIMIT:-768m}
+    cpus: ${INTENT_SCORING_WORKER_CPUS:-1.0}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - pipeline-net
     extra_hosts:
@@ -44,6 +67,14 @@ services:
     # SIGTERM lets the current batch finish (MySQL COMMIT, then offset commit) before exit.
     stop_grace_period: 60s
     mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 0.75
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - pipeline-net
     extra_hosts:

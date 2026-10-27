@@ -6,6 +6,7 @@ filters, score, resolve that session's date's already-persisted thresholds
 actor_ids for the caller to recompute.
 """
 
+import os
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -93,17 +94,42 @@ def score_window_for_brand(
     """
     started_at = time.monotonic()
     reader = read_cursor if read_cursor is not None else cursor
-    sessions = fetch_eligible_sessions(reader, window_start, window_end)
-    if not sessions:
+    page_size = _window_page_size()
+
+    # The window is read and scored one page at a time (oldest first) instead of loading every
+    # eligible session of the window into memory. Scoring is per session and the touched actors are
+    # recomputed afterwards by the caller, so the result is the same as one big pass.
+    touched: Set[str] = set()
+    after = None
+    total = 0
+    while True:
+        sessions = fetch_eligible_sessions(reader, window_start, window_end, page_size, after)
+        if not sessions:
+            break
+        total += len(sessions)
+        touched |= score_sessions(
+            cursor, connection, sessions, now, read_cursor=read_cursor,
+            label=f"range={window_start}..{window_end} page_end={sessions[-1].get('updated_at')}",
+            started_at=time.monotonic(),
+        )
+        if len(sessions) < page_size:
+            break
+        last = sessions[-1]
+        after = (last["updated_at"], last["session_id"])
+
+    if not total:
         logger.info(
             "[intent scoring] range=%s..%s: no closed eligible sessions", window_start, window_end
         )
-        return set()
+    return touched
 
-    return score_sessions(
-        cursor, connection, sessions, now, read_cursor=read_cursor,
-        label=f"range={window_start}..{window_end}", started_at=started_at,
-    )
+
+def _window_page_size() -> int:
+    """INTENT_SCORING_WINDOW_CHUNK: sessions read and scored per page of the scoring window."""
+    try:
+        return max(100, int(os.environ.get("INTENT_SCORING_WINDOW_CHUNK", "2000")))
+    except ValueError:
+        return 2000
 
 
 def score_sessions(

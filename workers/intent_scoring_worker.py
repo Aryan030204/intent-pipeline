@@ -21,7 +21,10 @@ intent_engine/INTENT_SCORING.md for why they're split):
 import logging
 import os
 import sys
+import threading
 import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -68,11 +71,58 @@ def _run_migrations() -> None:
         logger.error("Error running database migrations on startup: %s", e)
 
 
+# Scoring runs on even hours at :27 IST (was :00) and calibration at 02:10 (was 02:00): off the ETL's
+# :00/:10/... ticks, the rollup's :00/:15/:30/:45 ticks and the midnight job cluster. Scoring only reads
+# sessions already written, so the minute does not change what it scores.
+SCORING_CRON_MINUTE = 27
+CALIBRATION_CRON_MINUTE = 10
+STARTUP_DELAY_S = max(0, int(os.environ.get("INTENT_SCORING_STARTUP_DELAY_S", "210") or 0))
+_IST = ZoneInfo("Asia/Kolkata")
+# One heavy pass at a time inside this process (startup runs, scheduled scoring, calibration).
+_heavy_lock = threading.Lock()
+
+
+def _locked(fn, name, wait=False):
+    # Scheduled runs skip when another heavy pass is still running (the next tick catches up); the
+    # startup passes wait their turn instead, so the catch-up is never silently dropped.
+    if not _heavy_lock.acquire(blocking=wait):
+        logger.info("%s skipped: another intent job is still running", name)
+        return
+    try:
+        fn()
+    except Exception as e:
+        logger.error("Error in %s: %s", name, e)
+    finally:
+        _heavy_lock.release()
+
+
+def _scoring_job() -> None:
+    _locked(run_intent_scoring_pipeline, "intent scoring")
+
+
+def _calibration_job() -> None:
+    _locked(run_intent_calibration_pipeline, "intent calibration")
+
+
+def _startup_runs() -> None:
+    """Catch-up of pending sessions, then scoring, then calibration - each independently guarded."""
+    for fn, name in (
+        (run_intent_scoring_catchup, "startup catch-up of pending sessions"),
+        (run_intent_scoring_pipeline, "startup run of intent scoring"),
+        (run_intent_calibration_pipeline, "startup run of intent calibration"),
+    ):
+        logger.info("Running %s", name)
+        _locked(fn, name, wait=True)
+
+
 def _run_scheduled() -> None:
     """
-    Runs both the scoring pipeline and the calibration pipeline once
-    immediately on startup (so a redeploy/restart doesn't wait up to 2
-    hours - or a full day, for calibration - for fresh results), then
+    Runs the catch-up, the scoring pipeline and the calibration pipeline once
+    shortly after startup (so a redeploy/restart doesn't wait up to 2
+    hours - or a full day, for calibration - for fresh results). The startup
+    runs wait INTENT_SCORING_STARTUP_DELAY_S (default 210 s) so a host restart
+    doesn't start every pipeline's work at the same moment; the schedule below
+    is registered first so it is never missed. Then
     schedules both jobs on their own cron triggers from that point on.
     Each immediate run is independently try/excepted so one failing
     doesn't block the other. Both are safe to run redundantly on every
@@ -88,32 +138,22 @@ def _run_scheduled() -> None:
 
     _run_migrations()
 
-    # First, work off the sessions still pending from after the last one the engine processed,
-    # so a restart (or a period of downtime) never leaves a backlog waiting for the cron.
-    logger.info("Running intent scoring catch-up of pending sessions on startup")
-    try:
-        run_intent_scoring_catchup()
-    except Exception as e:
-        logger.error("Error in startup catch-up of pending sessions: %s", e)
-
-    logger.info("Running intent scoring pipeline once immediately on startup")
-    try:
-        run_intent_scoring_pipeline()
-    except Exception as e:
-        logger.error("Error in immediate startup run of intent scoring pipeline: %s", e)
-
-    logger.info("Running intent calibration pipeline once immediately on startup")
-    try:
-        run_intent_calibration_pipeline()
-    except Exception as e:
-        logger.error("Error in immediate startup run of intent calibration pipeline: %s", e)
-
     scheduler = BlockingScheduler(timezone="Asia/Kolkata")
+    # Catch-up, scoring and calibration, one after the other, once, after the startup delay. A single
+    # job (not three) so the three never run at the same time, and it shares the scoring job's lock
+    # so a scheduled scoring run cannot overlap it.
     scheduler.add_job(
-        run_intent_scoring_pipeline,
+        _startup_runs,
+        "date",
+        run_date=datetime.now(_IST) + timedelta(seconds=STARTUP_DELAY_S),
+        id="intent_scoring_startup",
+        max_instances=1,
+    )
+    scheduler.add_job(
+        _scoring_job,
         "cron",
         hour="*/2",
-        minute=0,
+        minute=SCORING_CRON_MINUTE,
         second=0,
         id="intent_scoring_job",
         coalesce=True,
@@ -121,10 +161,10 @@ def _run_scheduled() -> None:
         misfire_grace_time=600,
     )
     scheduler.add_job(
-        run_intent_calibration_pipeline,
+        _calibration_job,
         "cron",
         hour=2,
-        minute=0,
+        minute=CALIBRATION_CRON_MINUTE,
         second=0,
         id="intent_calibration_job",
         coalesce=True,
@@ -133,7 +173,8 @@ def _run_scheduled() -> None:
     )
     logger.info(
         "Intent scoring worker scheduler started "
-        "(scoring every 2 hours, calibration daily at 02:00 IST)"
+        "(scoring every 2 hours at :%02d, calibration daily at 02:%02d IST, startup runs in %ss)",
+        SCORING_CRON_MINUTE, CALIBRATION_CRON_MINUTE, STARTUP_DELAY_S
     )
     try:
         scheduler.start()

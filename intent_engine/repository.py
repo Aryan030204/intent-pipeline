@@ -173,17 +173,30 @@ _ELIGIBLE_SESSION_COLUMNS = (
 )
 
 
-def fetch_eligible_sessions(cursor, window_start: datetime, window_end: datetime) -> List[Dict[str, Any]]:
+def fetch_eligible_sessions(
+    cursor, window_start: datetime, window_end: datetime,
+    limit: Optional[int] = None, after: Optional[tuple] = None,
+) -> List[Dict[str, Any]]:
+    """Closed sessions updated in [window_start, window_end).
+
+    Without `limit` every row is returned (the original behaviour). With `limit` the rows come back
+    oldest first in pages of at most `limit`; pass the (updated_at, session_id) of the last row of the
+    previous page as `after` to get the next one."""
     columns_sql = ", ".join(_ELIGIBLE_SESSION_COLUMNS)
-    cursor.execute(
-        f"""
+    sql = f"""
         SELECT {columns_sql}
         FROM intent_sessions
         WHERE updated_at >= %s AND updated_at < %s
               AND session_time_spent_ms IS NOT NULL
-        """,
-        (window_start, window_end),
-    )
+        """
+    params: List[Any] = [window_start, window_end]
+    if limit is not None:
+        if after is not None:
+            sql += " AND (updated_at > %s OR (updated_at = %s AND session_id > %s))"
+            params += [after[0], after[0], after[1]]
+        sql += " ORDER BY updated_at, session_id LIMIT %s"
+        params.append(int(limit))
+    cursor.execute(sql, tuple(params))
     return cursor.fetchall()
 
 

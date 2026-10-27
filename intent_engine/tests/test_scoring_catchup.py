@@ -188,21 +188,40 @@ def _run_worker_startup(monkeypatch, catchup):
     return order
 
 
-def test_worker_runs_the_catchup_first_then_the_normal_pass_then_the_cron(monkeypatch):
+def test_worker_defers_the_startup_runs_and_registers_the_cron(monkeypatch):
+    # Nothing heavy runs inline any more: the catch-up/scoring/calibration are one delayed job, and
+    # the recurring schedule is registered and started straight away.
     order = _run_worker_startup(monkeypatch, lambda o: (lambda: o.append("catchup")))
-    assert order == ["catchup", "scoring", "calibration", "cron:intent_scoring_job", "cron:intent_calibration_job", "scheduler_started"]
+    assert order == ["cron:intent_scoring_startup", "cron:intent_scoring_job", "cron:intent_calibration_job", "scheduler_started"]
+
+
+def test_the_delayed_startup_job_runs_the_catchup_first_then_the_normal_pass(monkeypatch):
+    order = []
+    sys.path.insert(0, "workers")
+    import importlib
+    worker = importlib.import_module("workers.intent_scoring_worker")
+    monkeypatch.setattr(worker, "run_intent_scoring_catchup", lambda: order.append("catchup"))
+    monkeypatch.setattr(worker, "run_intent_scoring_pipeline", lambda: order.append("scoring"))
+    monkeypatch.setattr(worker, "run_intent_calibration_pipeline", lambda: order.append("calibration"))
+    worker._startup_runs()
+    assert order == ["catchup", "scoring", "calibration"]
 
 
 def test_a_failing_catchup_never_blocks_the_normal_run_or_the_cron(monkeypatch):
-    def failing(order):
-        def run():
-            order.append("catchup")
-            raise RuntimeError("database unavailable")
-        return run
+    order = []
 
-    order = _run_worker_startup(monkeypatch, failing)
-    assert order[0] == "catchup"
-    assert "scoring" in order and "scheduler_started" in order
+    def failing():
+        order.append("catchup")
+        raise RuntimeError("database unavailable")
+
+    sys.path.insert(0, "workers")
+    import importlib
+    worker = importlib.import_module("workers.intent_scoring_worker")
+    monkeypatch.setattr(worker, "run_intent_scoring_catchup", failing)
+    monkeypatch.setattr(worker, "run_intent_scoring_pipeline", lambda: order.append("scoring"))
+    monkeypatch.setattr(worker, "run_intent_calibration_pipeline", lambda: order.append("calibration"))
+    worker._startup_runs()
+    assert order == ["catchup", "scoring", "calibration"]
 
 
 def test_catchup_can_be_switched_off(monkeypatch):
