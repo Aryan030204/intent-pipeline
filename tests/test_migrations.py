@@ -42,7 +42,7 @@ class Cursor:
             if self.no_tracking_table:
                 raise DbError(1146)
             self._rows = [{"version": v, "checksum": c} for v, c in self.applied.items()]
-        elif text.startswith("INSERT INTO schema_migrations"):
+        elif text.startswith("INSERT INTO intent_schema_migrations"):
             self.applied[params[0]] = params[1]
 
     def fetchall(self):
@@ -53,7 +53,7 @@ class Cursor:
 
     def work(self):
         """The migration statements only, without the runner's bookkeeping."""
-        skip = ("SELECT", "CREATE TABLE IF NOT EXISTS schema_migrations", "INSERT INTO schema_migrations")
+        skip = ("SELECT", "CREATE TABLE IF NOT EXISTS intent_schema_migrations", "INSERT INTO intent_schema_migrations")
         return [s for s in self.executed if not s.startswith(skip)]
 
 
@@ -141,7 +141,24 @@ def test_not_getting_the_lock_changes_nothing():
 def test_the_tracking_table_is_created_if_missing():
     cursor = Cursor(no_tracking_table=True)
     run(cursor, [migration("001_a", "ALTER TABLE a ADD x INT")])
-    assert any(s.startswith("CREATE TABLE IF NOT EXISTS schema_migrations") for s in cursor.executed)
+    assert any(s.startswith("CREATE TABLE IF NOT EXISTS intent_schema_migrations") for s in cursor.executed)
+
+
+def test_the_runner_never_touches_a_plain_schema_migrations_table():
+    # production databases already have a table of that name made by something else, with another layout
+    assert mig.TRACKING_TABLE == "intent_schema_migrations"
+    cursor = Cursor()
+    run(cursor, [migration("001_a", "ALTER TABLE a ADD x INT")])
+    for statement in cursor.executed:
+        assert " schema_migrations" not in statement, statement
+
+
+def test_failing_to_record_a_migration_is_reported_and_stops_the_run_without_raising():
+    cursor = Cursor(fail={"INSERT INTO intent_schema_migrations": DbError(1054, "Unknown column 'note'")})
+    outcome = run(cursor, [migration("001_a", "ALTER TABLE a ADD x INT"), migration("002_b", "ALTER TABLE b ADD y INT")])
+    assert "001_a: applied but not recorded" in outcome.failed and "errno=1054" in outcome.failed
+    assert cursor.work() == ["ALTER TABLE a ADD x INT"]        # the next file did not run
+    assert outcome.applied == [] and outcome.adopted == []
 
 
 # ---- the MySQL version gate ----

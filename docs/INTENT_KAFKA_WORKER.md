@@ -140,7 +140,7 @@ different brands share partitions. The `utm_*` columns are the exception: they a
 `docker compose up --build` and a plain restart both bring the databases up to date. It is safe to run from
 all three at once and on every restart:
 
-- applied versions are recorded in `schema_migrations` (per brand database) and never run again;
+- applied versions are recorded in `intent_schema_migrations` (per brand database) and never run again;
 - a MySQL `GET_LOCK` on the same connection serialises the containers; the second finds nothing left to do;
 - "already exists" errors (duplicate column / key / table) count as already applied, so `001` and `002`,
   which were applied by hand before the runner existed, are adopted and recorded;

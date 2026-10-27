@@ -6,7 +6,7 @@ container (intent-kafka-worker, intent-data-aggregation, intent-scoring-worker) 
 does anything else, so a rebuild or restart brings every brand database up to date by itself.
 
 How it stays safe to call from three containers that start together, on every restart, forever:
-- Applied versions are recorded per brand database in schema_migrations; a recorded file is never run again.
+- Applied versions are recorded per brand database in intent_schema_migrations; a recorded file is never run again.
 - A MySQL named lock (GET_LOCK) held on the same connection serialises concurrent runners; the second one
   finds everything applied.
 - "Already exists" errors (duplicate column, duplicate key name, table exists) count as already applied, so
@@ -30,7 +30,10 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from pipeline.state import logger
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations")
-TRACKING_TABLE = "schema_migrations"
+# Its own name: a table called plain "schema_migrations" already exists in the brand databases (made by something
+# else, with a different layout), and CREATE TABLE IF NOT EXISTS would have left that one in place, so the runner's
+# insert failed on a column it does not have.
+TRACKING_TABLE = "intent_schema_migrations"
 LOCK_NAME = "intent-migrations"
 
 # ER_DUP_FIELDNAME, ER_DUP_KEYNAME, ER_TABLE_EXISTS_ERROR: the change is already in place.
@@ -149,12 +152,19 @@ def _apply(cursor, connection, migration: Migration, rebuild_ok: bool, outcome: 
                 continue
             outcome.failed = f"{migration.version}: errno={errno} {type(exc).__name__}: {str(exc)[:200]}"
             return False
-    cursor.execute(
-        f"INSERT INTO {TRACKING_TABLE} (version, checksum, note) VALUES (%s, %s, %s) "
-        f"ON DUPLICATE KEY UPDATE version = version",
-        (migration.version, migration.checksum, "adopted: already in place" if adopted_any else None),
-    )
-    connection.commit()
+    try:
+        cursor.execute(
+            f"INSERT INTO {TRACKING_TABLE} (version, checksum, note) VALUES (%s, %s, %s) "
+            f"ON DUPLICATE KEY UPDATE version = version",
+            (migration.version, migration.checksum, "adopted: already in place" if adopted_any else None),
+        )
+        connection.commit()
+    except Exception as exc:
+        # The statements ran but could not be recorded. Say so plainly instead of raising: the next start
+        # re-runs the file, and "already exists" errors make that harmless.
+        outcome.failed = (f"{migration.version}: applied but not recorded in {TRACKING_TABLE} "
+                          f"(errno={getattr(exc, 'errno', None)} {type(exc).__name__}: {str(exc)[:160]})")
+        return False
     (outcome.adopted if adopted_any else outcome.applied).append(migration.version)
     return True
 
