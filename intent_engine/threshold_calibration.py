@@ -73,8 +73,13 @@ def calibrate_date_for_brand(
     )
     scored_session_count = len(scores)
 
-    if scored_session_count >= MIN_SESSIONS_FOR_PERCENTILE_CALIBRATION:
-        sorted_scores = sorted(scores)
+    # Sessions that scored 0 (bounces and other one-page visits) are always "low" (see assign_bucket), so they
+    # are left out of the percentiles. Counting them would drag P35 down to 0 and shrink every other cut-off
+    # whenever bounces are a large share of the day, which they now are that every session is scored.
+    engaged_scores = [s for s in scores if s > 0]
+
+    if len(engaged_scores) >= MIN_SESSIONS_FOR_PERCENTILE_CALIBRATION:
+        sorted_scores = sorted(engaged_scores)
         p35 = _percentile(sorted_scores, 35)
         p72 = _percentile(sorted_scores, 72)
         calibration_method = "percentile"

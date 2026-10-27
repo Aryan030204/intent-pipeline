@@ -39,8 +39,11 @@ def assign_bucket(predictive_score: float, p35_threshold: float, p72_threshold: 
     score < P35 -> low; P35 <= score < P72 -> medium; score >= P72 -> high.
     P35/P72 are percentiles (or fixed fallback values), never fixed score
     constants themselves - see threshold_resolution.py / threshold_calibration.py.
+
+    A score of 0 is always low. Short sessions (a bounce, a one-page visit) clamp to exactly 0; when
+    they are a large share of a day, P35 itself is 0 and `score < P35` would put them in medium.
     """
-    if predictive_score < p35_threshold:
+    if predictive_score <= 0 or predictive_score < p35_threshold:
         return "low"
     if predictive_score < p72_threshold:
         return "medium"

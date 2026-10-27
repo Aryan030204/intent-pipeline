@@ -58,7 +58,10 @@ _VALUE_EXCLUDED_TAGS = {"input", "textarea", "select"}
 PAGE_PATH_MAX_LEN = 255
 SEQUENCE_MAX_LEN = 500
 SEQUENCE_MAX_STEPS = 15
-ROLLUP_MAX_SESSIONS_PER_DATE = 50000
+# Safety valve per day, and the chunk size the path rollup reads sessions in. Every session is stored now
+# (one-visit sessions included), so a busy brand has far more than the old 50,000 a day.
+ROLLUP_MAX_SESSIONS_PER_DATE = int(os.environ.get("ROLLUP_MAX_SESSIONS_PER_DATE", "300000") or 300000)
+ROLLUP_PATH_CHUNK = 20000
 
 _NUMERIC_SEGMENT = re.compile(r"^\d+$")
 _UUID_SEGMENT = re.compile(
@@ -1232,37 +1235,64 @@ def _rollup_behavioral_path_daily(cursor, connection, dates: List[date], source:
 
     for target_date in dates:
         day_start, day_end = _date_range_bounds(target_date)
-        cursor.execute(
-            """
-            SELECT session_id, actor_id, event_sequence, add_to_cart_count, checkout_started_count
-            FROM intent_sessions
-            WHERE session_start >= %s AND session_start < %s
-            LIMIT %s
-            """,
-            (day_start, day_end, ROLLUP_MAX_SESSIONS_PER_DATE),
-        )
-        session_rows = cursor.fetchall()
-        total_scanned += len(session_rows)
-        if len(session_rows) >= ROLLUP_MAX_SESSIONS_PER_DATE:
+
+        # Every session is read now (the idle-session sweep gives one-visit sessions a row too), which can be
+        # tens of thousands a day each with its JSON event sequence. They are read in keyset-paged chunks and
+        # folded into the buckets as they arrive, so memory stays small and the single-statement scan is gone.
+        buckets: Dict[str, Dict[str, Any]] = {}
+        day_total = 0
+        last_key = None
+        while day_total < ROLLUP_MAX_SESSIONS_PER_DATE:
+            limit = min(ROLLUP_PATH_CHUNK, ROLLUP_MAX_SESSIONS_PER_DATE - day_total)
+            if last_key is None:
+                cursor.execute(
+                    """
+                    SELECT id, session_start, session_id, actor_id, event_sequence, add_to_cart_count,
+                           checkout_started_count
+                    FROM intent_sessions
+                    WHERE session_start >= %s AND session_start < %s
+                    ORDER BY session_start, id
+                    LIMIT %s
+                    """,
+                    (day_start, day_end, limit),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, session_start, session_id, actor_id, event_sequence, add_to_cart_count,
+                           checkout_started_count
+                    FROM intent_sessions
+                    WHERE session_start >= %s AND session_start < %s
+                          AND (session_start > %s OR (session_start = %s AND id > %s))
+                    ORDER BY session_start, id
+                    LIMIT %s
+                    """,
+                    (day_start, day_end, last_key[0], last_key[0], last_key[1], limit),
+                )
+            chunk = cursor.fetchall()
+            for row in chunk:
+                sequence_hash, summary, _step_count = _compute_sequence_path(row["event_sequence"])
+                b = buckets.setdefault(sequence_hash, {
+                    "sequence": summary, "session_count": 0, "unique_actors": set(),
+                    "sessions_with_atc": 0, "sessions_with_checkout": 0,
+                })
+                b["session_count"] += 1
+                if row["actor_id"]:
+                    b["unique_actors"].add(row["actor_id"])
+                if (row["add_to_cart_count"] or 0) > 0:
+                    b["sessions_with_atc"] += 1
+                if (row["checkout_started_count"] or 0) > 0:
+                    b["sessions_with_checkout"] += 1
+            day_total += len(chunk)
+            if len(chunk) < limit:
+                break
+            last_key = (chunk[-1]["session_start"], chunk[-1]["id"])
+        else:
             logger.warning(
                 "[rollup behavioral_path_daily] date=%s hit ROLLUP_MAX_SESSIONS_PER_DATE=%s cap",
                 target_date, ROLLUP_MAX_SESSIONS_PER_DATE,
             )
-
-        buckets: Dict[str, Dict[str, Any]] = {}
-        for row in session_rows:
-            sequence_hash, summary, _step_count = _compute_sequence_path(row["event_sequence"])
-            b = buckets.setdefault(sequence_hash, {
-                "sequence": summary, "session_count": 0, "unique_actors": set(),
-                "sessions_with_atc": 0, "sessions_with_checkout": 0,
-            })
-            b["session_count"] += 1
-            if row["actor_id"]:
-                b["unique_actors"].add(row["actor_id"])
-            if (row["add_to_cart_count"] or 0) > 0:
-                b["sessions_with_atc"] += 1
-            if (row["checkout_started_count"] or 0) > 0:
-                b["sessions_with_checkout"] += 1
+        total_scanned += day_total
 
         rows: List[Tuple] = []
         computed_keys: Set[Tuple] = set()

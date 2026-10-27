@@ -530,13 +530,13 @@ def bulk_reassign_buckets_for_date(
         """
         UPDATE intent_sessions
         SET intent_bucket = CASE
-                WHEN predictive_score < %s THEN 'low'
+                WHEN predictive_score <= 0 OR predictive_score < %s THEN 'low'
                 WHEN predictive_score < %s THEN 'medium'
                 ELSE 'high' END,
             operational_bucket = CASE
                 WHEN entry_page_type = 'checkout' OR checkout_started_count > 0
                      OR add_to_cart_count > 0 THEN 'high'
-                WHEN predictive_score < %s THEN 'low'
+                WHEN predictive_score <= 0 OR predictive_score < %s THEN 'low'
                 WHEN predictive_score < %s THEN 'medium'
                 ELSE 'high' END,
             updated_at = updated_at
