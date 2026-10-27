@@ -127,10 +127,50 @@ any infrastructure error.
 ## Schema
 
 Existing: `behavioral_events`, `click_events`, `intent_sessions` (created by `pipeline/intent_events.py`).
-New, by `migrations/001_intent_kafka_state.sql` (idempotent, run by hand per brand database, BBB already
-has them): `intent_actor_cursors`, `intent_atc_dedupe`. The worker never runs DDL. At startup it verifies
-every mapped brand database read-only (tables, columns, primary and unique keys) and exits if one is not
-ready, because records of different brands share partitions.
+Added by migrations: `intent_actor_cursors`, `intent_atc_dedupe` (`001`), an index on
+`intent_actor_cursors.last_event_at` (`002`), and the `utm_source`, `utm_medium`, `utm_campaign`, `utm_term`,
+`utm_content` columns on both event tables (`003`). The worker verifies every mapped brand database read-only
+at startup (tables, columns, primary and unique keys) and exits if one is not ready, because records of
+different brands share partitions. The `utm_*` columns are the exception: they are optional there (see below).
+
+### Migrations run on every container start
+
+`pipeline/migrations.py` applies the pending `migrations/NNN_*.sql` files to every brand database in
+`INTENT_DB_MAP`. All three containers (kafka worker, aggregation, scoring) call it once when they start, so
+`docker compose up --build` and a plain restart both bring the databases up to date. It is safe to run from
+all three at once and on every restart:
+
+- applied versions are recorded in `schema_migrations` (per brand database) and never run again;
+- a MySQL `GET_LOCK` on the same connection serialises the containers; the second finds nothing left to do;
+- "already exists" errors (duplicate column / key / table) count as already applied, so `001` and `002`,
+  which were applied by hand before the runner existed, are adopted and recorded;
+- a file with `-- requires-mysql: X.Y.Z` runs only on a server at least that new (`SELECT VERSION()`).
+  `003` uses `ALGORITHM=INSTANT` (8.0.12+: no table rebuild, no I/O burst). On an older server it is
+  deferred and logged; `INTENT_MIGRATE_ALLOW_REBUILD=true` rewrites it to an online rebuild instead (heavy I/O);
+- it never fails a container: a problem is logged as `category=migration_failed` / `migration_deferred` /
+  `migration_skipped` and the container carries on. Turn it off with `INTENT_MIGRATE_ON_START=off`.
+
+Because of that, the worker keeps ingesting when a database does not have the `utm_*` columns yet: it writes
+those events without them (and re-checks every 5 minutes, so applying the migration by hand takes effect
+without a restart). Log lines: `utm_columns_missing` at startup, `utm_columns_present` when they appear.
+`--preflight` stays read-only and lists the migrations that will be applied on the next start.
+
+### UTM columns
+
+`pipeline/utm.py` reads the UTM parameters from each event's own `url` (query string, or a query after `#`;
+names case-insensitive, values decoded and trimmed, first value wins, 255 characters, empty = NULL). The full
+`url` is still stored. Only the event whose URL carries the parameters gets values; later pages of the same
+session usually have none. There are no indexes on the columns on purpose (write cost).
+
+Rows stored before the columns existed stay NULL until you fill them with the backfill script. Run it by
+hand, never from a container start:
+
+    docker exec intent-kafka-worker python scripts/backfill_utm.py \
+        --brand BBB --from 2026-10-01 --to 2026-10-27 --tables events,clicks --batch 2000 --sleep 0.5 [--dry-run]
+
+It only touches rows in the date range whose `utm_*` columns are all NULL and whose `url` contains `utm_`,
+in batches by id with a pause between batches and a commit per batch (gentle on the EBS balance), and it can
+be stopped and re-run.
 
 ## Cursor discipline
 

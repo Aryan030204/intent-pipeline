@@ -28,8 +28,14 @@ from pipeline.intent_events import (
     _INTENT_SESSIONS_UPSERT_COLUMNS,
 )
 from pipeline.intent_session_state import ActorCursor
+from pipeline.state import logger
+from pipeline.utm import UTM_COLUMNS
 
 MIGRATION_FILE = "migrations/001_intent_kafka_state.sql"
+# The utm_* columns are the last len(UTM_COLUMNS) of the event column tuples and row tuples. A brand database
+# that does not have them yet (migration 003 not applied or deferred) is written without them (row[:-5]) so a
+# pending migration never stops ingestion; they are not "required" and verify_schema only warns about them.
+UTM_COUNT = len(UTM_COLUMNS)
 # Store-local clocks are at most UTC+14. An event time further ahead than that is bad data (a client with a
 # wrong date); the idle-session sweep must not treat it as the current time.
 FUTURE_TOLERANCE_HOURS = 14
@@ -37,9 +43,14 @@ CURSOR_TABLE = "intent_actor_cursors"
 ATC_TABLE = "intent_atc_dedupe"
 CURSOR_COLUMNS = ("actor_id", "session_id", "session_start", "last_event_at", "last_event_id", "events_seq")
 
+def _without_utm(columns: Sequence[str]) -> Tuple[str, ...]:
+    assert tuple(columns[-UTM_COUNT:]) == tuple(UTM_COLUMNS), "the utm columns must be last"
+    return tuple(columns[:-UTM_COUNT])
+
+
 REQUIRED_COLUMNS: Dict[str, Tuple[str, ...]] = {
-    "behavioral_events": tuple(_BEHAVIORAL_UPSERT_COLUMNS),
-    "click_events": tuple(_CLICK_EVENTS_UPSERT_COLUMNS),
+    "behavioral_events": _without_utm(_BEHAVIORAL_UPSERT_COLUMNS),
+    "click_events": _without_utm(_CLICK_EVENTS_UPSERT_COLUMNS),
     "intent_sessions": tuple(_INTENT_SESSIONS_UPSERT_COLUMNS),
     CURSOR_TABLE: CURSOR_COLUMNS,
     ATC_TABLE: ("session_id", "product_id"),
@@ -68,6 +79,9 @@ def _insert_noop_on_duplicate(table: str, columns: Sequence[str], key: str) -> s
 
 EVENT_INSERT_SQL = _insert_noop_on_duplicate("behavioral_events", _BEHAVIORAL_UPSERT_COLUMNS, "event_id")
 CLICK_INSERT_SQL = _insert_noop_on_duplicate("click_events", _CLICK_EVENTS_UPSERT_COLUMNS, "event_id")
+# The same statements for a database without the utm_* columns.
+EVENT_INSERT_SQL_NO_UTM = _insert_noop_on_duplicate("behavioral_events", _without_utm(_BEHAVIORAL_UPSERT_COLUMNS), "event_id")
+CLICK_INSERT_SQL_NO_UTM = _insert_noop_on_duplicate("click_events", _without_utm(_CLICK_EVENTS_UPSERT_COLUMNS), "event_id")
 ATC_CLAIM_SQL = _insert_noop_on_duplicate(ATC_TABLE, ("session_id", "product_id"), "session_id")
 SESSION_UPSERT_SQL = (
     f"INSERT INTO intent_sessions ({', '.join(_INTENT_SESSIONS_UPSERT_COLUMNS)}) "
@@ -136,6 +150,14 @@ def verify_schema(cursor) -> None:
         for column in columns:
             if column not in have[table]:
                 raise SchemaMissing(f"{table}.{column} is missing")
+    # Optional: without the utm_* columns events are stored without UTM values until migration 003 is applied.
+    for table in ("behavioral_events", "click_events"):
+        absent = [c for c in UTM_COLUMNS if c not in have[table]]
+        if absent:
+            logger.warning(
+                f"[intent-kafka] category=utm_columns_missing table={table} missing={absent}; events are stored "
+                f"without UTM values until migrations/003_event_utm_columns.sql is applied"
+            )
 
     cursor.execute(
         f"SELECT table_name AS tbl, index_name AS idx, non_unique AS nu, column_name AS col "
@@ -159,6 +181,19 @@ def verify_schema(cursor) -> None:
             index_unique.get(k) and tuple(v) == expected for k, v in index_cols.items() if k[0] == table
         ):
             raise SchemaMissing(f"{table} has no unique key on {expected}; duplicates would not be detected")
+
+
+def utm_columns_present(cursor) -> bool:
+    """True when both event tables of the connected database have all the utm_* columns."""
+    marks = ", ".join(["%s"] * len(UTM_COLUMNS))
+    cursor.execute(
+        f"SELECT table_name AS tbl, COUNT(*) AS n FROM information_schema.columns "
+        f"WHERE table_schema = DATABASE() AND table_name IN ('behavioral_events', 'click_events') "
+        f"AND column_name IN ({marks}) GROUP BY table_name",
+        list(UTM_COLUMNS),
+    )
+    counts = {_cell(r, 0, "tbl"): int(_cell(r, 1, "n")) for r in cursor.fetchall()}
+    return counts.get("behavioral_events") == UTM_COUNT and counts.get("click_events") == UTM_COUNT
 
 
 def migration_statements() -> List[str]:
@@ -243,8 +278,9 @@ _EVENT_TABLES = {"event": ("behavioral_events", _BEHAVIORAL_UPSERT_COLUMNS),
 class MySqlIntentStore:
     """One brand database inside one open transaction. The caller commits or rolls back."""
 
-    def __init__(self, cursor) -> None:
+    def __init__(self, cursor, utm: bool = True) -> None:
         self.cursor = cursor
+        self.utm = utm            # False: this database has no utm_* columns yet; rows are written without them
         self._savepoints = 0
 
     def savepoint(self) -> str:
@@ -282,7 +318,10 @@ class MySqlIntentStore:
         )
 
     def insert_event(self, kind: str, row: tuple) -> bool:
-        self.cursor.execute(EVENT_INSERT_SQL if kind == "event" else CLICK_INSERT_SQL, row)
+        if self.utm:
+            self.cursor.execute(EVENT_INSERT_SQL if kind == "event" else CLICK_INSERT_SQL, row)
+        else:
+            self.cursor.execute(EVENT_INSERT_SQL_NO_UTM if kind == "event" else CLICK_INSERT_SQL_NO_UTM, row[:-UTM_COUNT])
         return self.cursor.rowcount == 1
 
     def claim_atc(self, session_id: str, product_id: str) -> bool:
@@ -340,6 +379,9 @@ class MySqlIntentStore:
 
     def insert_events(self, kind: str, rows: Sequence[tuple]) -> None:
         table, columns = _EVENT_TABLES[kind]
+        if not self.utm:
+            columns = _without_utm(columns)
+            rows = [row[:-UTM_COUNT] for row in rows]
         for chunk in bulk_chunks(rows):
             self.cursor.execute(bulk_insert_sql(table, columns, EVENT_TAIL, len(chunk)), _flatten(chunk))
 

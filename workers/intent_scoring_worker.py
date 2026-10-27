@@ -54,6 +54,20 @@ from intent_engine.runner import (
 )
 
 
+def _run_migrations() -> None:
+    """Brings every mapped brand database up to date (migrations/*.sql) before anything reads or writes it.
+    Once per container start; safe to run from several containers at once and never raises."""
+    try:
+        from pipeline.migrations import mapped_brand_indices, run_on_start
+        from pipeline.state import active_brand_indices
+
+        active_brand_indices.clear()
+        aws_background.initialize_brand_configs()
+        run_on_start(mapped_brand_indices())
+    except Exception as e:
+        logger.error("Error running database migrations on startup: %s", e)
+
+
 def _run_scheduled() -> None:
     """
     Runs both the scoring pipeline and the calibration pipeline once
@@ -71,6 +85,8 @@ def _run_scheduled() -> None:
     pipeline once and exit (e.g. for a one-off/manual invocation).
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
+
+    _run_migrations()
 
     # First, work off the sessions still pending from after the last one the engine processed,
     # so a restart (or a period of downtime) never leaves a backlog waiting for the cron.
@@ -132,4 +148,5 @@ if __name__ == "__main__":
     if self_run:
         _run_scheduled()
     else:
+        _run_migrations()
         run_intent_scoring_pipeline()

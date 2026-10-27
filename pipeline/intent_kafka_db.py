@@ -13,17 +13,45 @@ unread on it.
 """
 
 import contextlib
+import time
 from typing import Callable, Dict, Iterable, Optional, Tuple
 
 from pipeline.db import get_db_connection, get_db_cursor
-from pipeline.intent_kafka_store import MySqlIntentStore, assert_rowcount_semantics, verify_schema
+from pipeline.intent_kafka_store import (
+    MySqlIntentStore,
+    assert_rowcount_semantics,
+    utm_columns_present,
+    verify_schema,
+)
 from pipeline.state import logger
+
+UTM_RECHECK_S = 300   # how often a database without the utm_* columns is asked again whether it has them now
 
 
 class BrandConnections:
-    def __init__(self, connection_factory: Callable = get_db_connection) -> None:
+    def __init__(self, connection_factory: Callable = get_db_connection, clock: Callable[[], float] = time.monotonic) -> None:
         self._factory = connection_factory
+        self._clock = clock
         self._open: Dict[int, Tuple[object, object]] = {}  # brand_index -> (context manager, connection)
+        self._utm: Dict[int, Tuple[float, bool]] = {}      # brand_index -> (checked at, has the utm_* columns)
+
+    def _has_utm(self, brand_index: int, cursor) -> bool:
+        """Whether this brand's event tables have the utm_* columns. A database that has them is not asked
+        again; one that does not is re-checked every UTM_RECHECK_S, so applying the migration by hand takes
+        effect without a restart. If the check itself fails the events are written without UTM values (they
+        can be filled in later with scripts/backfill_utm.py) rather than risking an insert on a missing column."""
+        cached = self._utm.get(brand_index)
+        if cached is not None and (cached[1] or self._clock() - cached[0] < UTM_RECHECK_S):
+            return cached[1]
+        try:
+            present = utm_columns_present(cursor)
+        except Exception as exc:
+            logger.warning(f"[intent-kafka] category=utm_check_failed brand_index={brand_index} {type(exc).__name__}: {exc}")
+            present = False
+        if present and (cached is None or not cached[1]):
+            logger.info(f"[intent-kafka] category=utm_columns_present brand_index={brand_index} storing UTM values")
+        self._utm[brand_index] = (self._clock(), present)
+        return present
 
     def _connection(self, brand_index: int):
         entry = self._open.get(brand_index)
@@ -64,7 +92,7 @@ class BrandConnections:
         connection = self._connection(brand_index)
         cursor = connection.cursor(dictionary=True, buffered=True)
         try:
-            yield MySqlIntentStore(cursor)
+            yield MySqlIntentStore(cursor, utm=self._has_utm(brand_index, cursor))
             connection.commit()
         except BaseException:
             try:

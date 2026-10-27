@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from pipeline.state import IST, logger
+from pipeline.utm import UTM_COLUMNS, extract_utm
 from pipeline.db import (
     get_db_cursor,
     executemany_chunked,
@@ -244,6 +245,7 @@ def _extract_behavioral_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
         raw_values["scroll_percent"],
         json.dumps(raw, default=str),
         occurred_at,
+        *extract_utm(url),   # last, in the order of UTM_COLUMNS: matches the end of _BEHAVIORAL_UPSERT_COLUMNS
     )
 
 
@@ -297,6 +299,7 @@ def _extract_click_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
         click_bucket,
         json.dumps(data_payload, default=str),
         occurred_at,
+        *extract_utm(url),   # last, in the order of UTM_COLUMNS: matches the end of _CLICK_EVENTS_UPSERT_COLUMNS
     )
 
 
@@ -444,6 +447,12 @@ def _ensure_behavioral_events_table(cursor, connection) -> None:
             occurred_at DATETIME(6) NOT NULL,
             ingested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 
+            utm_source VARCHAR(255) NULL,
+            utm_medium VARCHAR(255) NULL,
+            utm_campaign VARCHAR(255) NULL,
+            utm_term VARCHAR(255) NULL,
+            utm_content VARCHAR(255) NULL,
+
             PRIMARY KEY (id),
             UNIQUE KEY uq_event_id (event_id),
             KEY idx_occurred_at (occurred_at),
@@ -510,6 +519,12 @@ def _ensure_click_events_table(cursor, connection) -> None:
 
             occurred_at DATETIME(6) NOT NULL,
             ingested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+
+            utm_source VARCHAR(255) NULL,
+            utm_medium VARCHAR(255) NULL,
+            utm_campaign VARCHAR(255) NULL,
+            utm_term VARCHAR(255) NULL,
+            utm_content VARCHAR(255) NULL,
 
             PRIMARY KEY (id),
             UNIQUE KEY uq_event_id (event_id),
@@ -598,6 +613,7 @@ _BEHAVIORAL_UPSERT_COLUMNS = (
     "scroll_percent",
     "data",
     "occurred_at",
+    *UTM_COLUMNS,   # always the last five: a database without them yet is written with row[:-5] (see the store)
 )
 # ingested_at is deliberately excluded from the UPDATE clause: it should
 # reflect the event's *first* ingestion, not be reset by a later re-upsert
@@ -644,6 +660,7 @@ _CLICK_EVENTS_UPSERT_COLUMNS = (
     "click_bucket",
     "data",
     "occurred_at",
+    *UTM_COLUMNS,   # always the last five: a database without them yet is written with row[:-5] (see the store)
 )
 _CLICK_EVENTS_UPDATE_COLUMNS = tuple(
     c for c in _CLICK_EVENTS_UPSERT_COLUMNS if c != "event_id"

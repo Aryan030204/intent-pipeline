@@ -266,6 +266,24 @@ def preflight() -> int:
     brands = check("INTENT_DB_MAP resolves to active brand databases", resolve_brands)
     for brand_id, index in sorted((brands or {}).items()):
         check(f"schema ready for {brand_id} (brand_index {index})", lambda index=index: verify_brand_schemas([index]))
+
+    def report_pending_migrations(index):
+        """Read-only: names the migrations the worker applies by itself on its next start. Not a failure."""
+        from pipeline.db import get_db_cursor
+        from pipeline.migrations import pending
+
+        try:
+            with get_db_cursor(index) as (cursor, _connection):
+                versions = pending(cursor)
+        except Exception as exc:   # informational only: never makes the preflight fail
+            logger.warning(f"[preflight] note brand_index={index}: could not read migration status: {type(exc).__name__}: {exc}")
+            return
+        if versions:
+            logger.info(f"[preflight] note brand_index={index}: migrations applied automatically on start: {versions}")
+
+    if not failures:
+        for _brand_id, index in sorted((brands or {}).items()):
+            report_pending_migrations(index)
     check(f"Kafka topics {list(config.topics)} and DLQ {config.dlq_topic} exist", lambda: check_topics(config))
     logger.info("[preflight] ready to start" if not failures else f"[preflight] NOT READY: {failures}")
     return 1 if failures else 0
@@ -279,9 +297,13 @@ def main() -> None:
 
     from pipeline.db import get_db_connection
     from pipeline.intent_kafka_db import BrandConnections, RunLock, verify_brand_schemas
+    from pipeline.migrations import run_on_start as run_migrations_on_start
 
     config = config_from_env()
     brands = resolve_brands()
+    # Pending migrations first (once per container start; never raises). Without the utm_* columns the worker
+    # still ingests, storing events without UTM values until they exist.
+    run_migrations_on_start(sorted(set(brands.values())))
     verify_brand_schemas(sorted(set(brands.values())))
     check_topics(config)
 

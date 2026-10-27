@@ -614,6 +614,17 @@ def initialize_brand_configs():
 # Main
 # ---------------------------
 if __name__ == "__main__":
+    # Bring every mapped brand database up to date (migrations/*.sql) before the first run touches it.
+    # Once per container start; safe alongside the other containers doing the same, and never raises.
+    try:
+        from pipeline.migrations import mapped_brand_indices, run_on_start
+
+        active_brand_indices.clear()
+        initialize_brand_configs()
+        run_on_start(mapped_brand_indices())
+    except Exception as e:
+        logger.error(f"Error running database migrations on startup: {e}")
+
     # Conditionally schedule the pipeline. initialize_brand_configs() itself
     # runs inside run_data_pipeline() on every invocation (not just here at
     # startup) so a long-lived process picks up new/changed brands without a
