@@ -31,7 +31,7 @@ def _run(monkeypatch, n, page):
     source = _PagedSource(_sessions(n))
     scored_batches = []
 
-    def fake_score(cursor, connection, sessions, now, read_cursor=None, label="", started_at=None):
+    def fake_score(cursor, connection, sessions, now, read_cursor=None, label="", started_at=None, stats=None):
         scored_batches.append([s["session_id"] for s in sessions])
         return {f"actor-{s['session_id']}" for s in sessions}
 

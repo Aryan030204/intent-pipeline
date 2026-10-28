@@ -736,6 +736,28 @@ def _upsert_rollup_rows(
     return upserted, deleted_total
 
 
+def _open_sessions_by_date(cursor, range_start, range_end) -> Optional[Dict[date, int]]:
+    """Open (not yet closed) sessions that started in [range_start, range_end), by day: one per visitor, from
+    intent_actor_cursors. The read is a range on last_event_at (migration 002's index; a session that started in the
+    window has a last event inside it or later), then session_start picks the sessions that began in the window.
+    None when the table cannot be read, in which case only the closed sessions are counted and the run says so."""
+    try:
+        cursor.execute(
+            """
+            SELECT DATE(session_start) AS d, COUNT(*) AS open_sessions
+            FROM intent_actor_cursors
+            WHERE session_id <> '' AND last_event_at >= %s AND session_start >= %s AND session_start < %s
+            GROUP BY DATE(session_start)
+            """,
+            (range_start, range_start, range_end),
+        )
+        return {r["d"]: int(r["open_sessions"] or 0) for r in cursor.fetchall()}
+    except Exception as exc:
+        logger.warning("[rollup intent_daily_summary] open sessions not counted (%s: %s); sessions_started is the "
+                       "closed sessions only", type(exc).__name__, str(exc)[:160])
+        return None
+
+
 # ---------------------------
 # Rollup 1: intent_daily_summary
 # ---------------------------
@@ -771,19 +793,19 @@ def _rollup_intent_daily_summary(cursor, connection, dates: List[date], source: 
     agg_rows = cursor.fetchall()
     scanned = sum(r["sessions"] for r in agg_rows) if agg_rows else 0
 
-    # Sessions that started that day, counted from the events themselves: a session exists from its first
-    # event, but intent_sessions only gets its row when the visitor comes back after the timeout, so the
-    # closed-session count above misses every visit that was never followed by another.
-    cursor.execute(
-        _src("""
-        SELECT DATE(occurred_at) AS d, COUNT(DISTINCT session_id) AS sessions_started
-        FROM behavioral_events
-        WHERE occurred_at >= %s AND occurred_at < %s AND session_id IS NOT NULL AND session_id <> ''
-        GROUP BY DATE(occurred_at)
-        """, source),
-        (range_start, range_end),
-    )
-    started_by_date = {r["d"]: int(r["sessions_started"] or 0) for r in cursor.fetchall()}
+    # Sessions that started that day, by the one canonical definition: a session is a row of intent_sessions
+    # (closed, or closed by the idle-session sweep) or, until it closes, the visitor's open session record in
+    # intent_actor_cursors. So the count is the closed rows above plus the open ones, and it reconciles with every
+    # other session figure built on those two tables (the dashboard's Total Sessions and the intent distribution).
+    # It used to be COUNT(DISTINCT session_id) over behavioral_events, a third population that misses sessions whose
+    # events are all clicks (they have no row there) and that cost a full pass over the day's events.
+    closed_by_date = {r["d"]: int(r["sessions"] or 0) for r in agg_rows}
+    open_by_date = _open_sessions_by_date(cursor, range_start, range_end)
+    started_by_date: Dict[date, int] = {}
+    for target_date in dates:
+        total = closed_by_date.get(target_date, 0) + (open_by_date or {}).get(target_date, 0)
+        if total:
+            started_by_date[target_date] = total
 
     by_date = {r["d"]: r for r in agg_rows}
     rows: List[Tuple] = []

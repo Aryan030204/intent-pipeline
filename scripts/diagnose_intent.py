@@ -10,7 +10,10 @@ thresholds, 4 predictive vs operational buckets, 5 cohorts, 6 features by bucket
 9 page types and overrides, 10 freshness (last ingestion / scoring / calibration / rollup), 11 duplicates,
 12 Score + Sessions next to Clarity (deltas in percentage points), 13 Feature | Low | Medium | High | Overall,
 14 do readers who do not click end up Low, 15 product view duplication, 16 bounce penalty impact,
-17 hard override impact. Compare with another tool's numbers with --clarity 42.87,44.77,12.36 --clarity-sessions 12251.
+17 hard override impact, 18 scoring backlog by day, 19 event-name census (do scroll events reach scroll_count?),
+20 dead-click rate distribution (why P90 is 1.0), 21 canonical session reconciliation (add --deep for the per-session check).
+Compare with another tool's numbers with --clarity 42.87,44.77,12.36 --clarity-sessions 12251, and run only some
+sections with --only 10,18,19. A day the scoring worker has already finished (say yesterday) gives the real Score view.
 
 Nothing is written, no schema is changed, and the heaviest query is one pass over the day's intent_sessions
 rows plus one DISTINCT over the day's events. Dates are the store-local calendar day the events carry.
@@ -120,6 +123,59 @@ def pivot_by_bucket(rows: Sequence[Dict[str, Any]], features: Sequence[str]) -> 
     for feature in features:
         out.append({"feature": feature, **{b: (None if by_bucket.get(b) is None or by_bucket[b].get(feature) is None
                                                else float(by_bucket[b][feature])) for b in ("low", "medium", "high", "overall")}})
+    return out
+
+
+DEAD_RATE_BUCKETS = ((0.0, 0.0, "0% dead"), (0.0, 0.25, "up to 25%"), (0.25, 0.5, "25-50%"), (0.5, 0.75, "50-75%"),
+                     (0.75, 0.9, "75-90%"), (0.9, 1.0, "90% up to 100%"), (1.0, 1.0, "exactly 100% dead"))
+
+
+def dead_click_summary(rates: Sequence[float]) -> Dict[str, Any]:
+    """Distribution of per-session dead-click rates (dead clicks / clicks, sessions with at least 10 clicks): the
+    percentiles the daily calibration takes (nearest rank), the maximum, and how many sessions sit at each level.
+    `at_or_above_p90` / `above_p90` show why a rule of "rate > P90" can never fire when P90 is the maximum."""
+    ordered = sorted(rates)
+    n = len(ordered)
+    if not n:
+        return {"count": 0}
+    pct = {f"P{p}": _percentile(ordered, p) for p in (50, 75, 90, 95, 99)}
+    buckets = []
+    for low, high, label in DEAD_RATE_BUCKETS:
+        if low == high:
+            count = sum(1 for r in ordered if r == low)
+        else:
+            count = sum(1 for r in ordered if low < r <= high and not (high == 1.0 and r == 1.0))
+        buckets.append({"dead_click_rate": label, "sessions": count, "share_pct": round(100 * count / n, 2)})
+    p90 = pct["P90"]
+    return {
+        "count": n, **pct, "max": ordered[-1],
+        "above_p90": sum(1 for r in ordered if r > p90), "at_or_above_p90": sum(1 for r in ordered if r >= p90),
+        "buckets": buckets,
+    }
+
+
+def reconciliation_report(n: Dict[str, Optional[int]]) -> List[Dict[str, Any]]:
+    """Canonical session counts next to every other session figure, each with its difference from the canonical total.
+    Canonical = finished rows of intent_sessions + open session records (the dashboard's Total Sessions)."""
+    closed, open_ = int(n.get("closed") or 0), int(n.get("open") or 0)
+    canonical = closed + open_
+    status = int(n.get("scored") or 0) + int(n.get("pending") or 0) + int(n.get("excluded") or 0)
+
+    def row(label, value, note=""):
+        return {"figure": label, "sessions": value, "diff_from_canonical": None if value is None else value - canonical, "note": note}
+
+    out = [
+        row("canonical sessions (closed rows + open)", canonical, "= dashboard Total Sessions"),
+        row("closed rows in intent_sessions", closed),
+        row("open session records (cursors)", open_, "live + waiting to be swept"),
+        row("scored + pending + excluded", status, "must equal the closed rows"),
+        row("  scored", n.get("scored")), row("  pending", n.get("pending")),
+        row("  excluded (all reasons)", n.get("excluded")), row("  of which bots", n.get("bots")),
+        row("  of which zero-signal", n.get("zero_signal")),
+        row("intent distribution population (closed, not bot)", n.get("distribution"), "behaviour donut, plus live sessions"),
+        row("rollup sessions_started", n.get("rollup"), "stale by up to one rollup run"),
+    ]
+    out[3]["note"] += "" if status == closed else f"  MISMATCH: {status - closed:+d} against the closed rows"
     return out
 
 
@@ -363,16 +419,99 @@ def page_types_and_overrides(q: Reader, start: datetime, end: datetime) -> None:
                 "FROM intent_sessions WHERE session_start >= %s AND session_start < %s AND intent_status = 'scored'", (start, end)))
 
 
-def freshness(q: Reader) -> None:
+def freshness(q: Reader, start: datetime) -> None:
     heading(10, "FRESHNESS: last ingestion, scoring, calibration, rollup")
+    # Cheap by design: the newest primary-key row, and a bounded window for the scoring time. MAX() over a column
+    # with no index (ingested_at, intent_scored_at) scans the whole table.
     table([
-        ("last event ingested (behavioral_events.ingested_at)", q.one("SELECT MAX(ingested_at) AS t FROM behavioral_events").get("t")),
-        ("last session row update (intent_sessions.updated_at)", q.one("SELECT MAX(updated_at) AS t FROM intent_sessions").get("t")),
-        ("last session scored (intent_scored_at)", q.one("SELECT MAX(intent_scored_at) AS t FROM intent_sessions").get("t")),
+        ("last event ingested (newest behavioral_events row)", (q.rows("SELECT ingested_at AS t FROM behavioral_events ORDER BY id DESC LIMIT 1") or [{}])[0].get("t")),
+        ("last session row written (newest intent_sessions row)", (q.rows("SELECT updated_at AS t FROM intent_sessions ORDER BY id DESC LIMIT 1") or [{}])[0].get("t")),
+        ("last session scored (sessions of the last 3 days)", q.one("SELECT MAX(intent_scored_at) AS t FROM intent_sessions WHERE session_start >= %s",
+                                                                    (start - timedelta(days=2),)).get("t")),
         ("last daily threshold row", (q.optional("SELECT MAX(score_date) AS t FROM intent_thresholds_daily") or [{}])[0].get("t")),
     ])
     show(q.optional("SELECT key_name, key_value FROM pipeline_metadata WHERE key_name LIKE 'intent%'"))
     say("  scoring runs every 2 h and calibrates 'yesterday' at 02:00 IST; the rollups run on ROLLUP_CRON_MINUTE.")
+
+
+def scoring_backlog(q: Reader, start: datetime, days: int = 10) -> None:
+    heading(18, "SCORING BACKLOG BY DAY (is the scoring worker keeping up?)")
+    say("  'pending' = closed or swept, not scored yet. A day with mostly pending sessions has an almost empty Score view.")
+    rows = q.rows("SELECT DATE_FORMAT(session_start, '%%Y-%%m-%%d') AS day, SUM(intent_status = 'scored') AS scored, "
+                  "SUM(intent_status = 'pending') AS pending, SUM(intent_status = 'excluded') AS excluded, COUNT(*) AS sessions "
+                  "FROM intent_sessions WHERE session_start >= %s AND session_start < %s GROUP BY 1 ORDER BY 1 DESC",
+                  (start - timedelta(days=days), start + timedelta(days=1)))
+    for r in rows:
+        total = int(r["sessions"]) or 1
+        r["scored_pct"] = round(100 * int(r["scored"] or 0) / total, 1)
+    show(rows)
+    say("  check the scoring worker: docker logs intent-scoring-worker 2>&1 | grep -E 'catchup|\\[intent scoring\\]' | tail -20")
+
+
+def event_census(q: Reader, start: datetime, end: datetime) -> None:
+    heading(19, "EVENT CENSUS: which event names exist, and do scroll events reach the scroll features?")
+    say("  scroll_count counts events named exactly 'scroll_depth' (pipeline/intent_events.py _SESSION_EVENT_NAME_COUNTERS).")
+    show(q.rows("SELECT event_name, COUNT(*) AS events, COUNT(DISTINCT session_id) AS sessions, SUM(scroll_percent IS NOT NULL) AS with_scroll_percent, "
+                "SUM(JSON_EXTRACT(data, '$.percent') IS NOT NULL) AS with_percent_in_data FROM behavioral_events "
+                "WHERE occurred_at >= %s AND occurred_at < %s GROUP BY event_name ORDER BY events DESC", (start, end)))
+    say("  sessions of the day with a scroll_count above 0 (from the closed rows):")
+    show(q.rows("SELECT COUNT(*) AS sessions, SUM(scroll_count > 0) AS with_scroll_count, SUM(click_count > 0) AS with_clicks, "
+                "SUM(page_view_count > 0) AS with_page_views FROM intent_sessions WHERE session_start >= %s AND session_start < %s", (start, end)))
+    say("  click events by what the browser reported (a 'meaningful_scroll' of 0 means that signal never fires):")
+    show(q.rows("SELECT SUM(meaningful_scroll) AS meaningful_scroll_true, SUM(meaningful_scroll IS NULL) AS meaningful_scroll_null, COUNT(*) AS clicks "
+                "FROM click_events WHERE occurred_at >= %s AND occurred_at < %s", (start, end)))
+
+
+def dead_click_distribution(q: Reader, start: datetime, end: datetime, day: date) -> None:
+    heading(20, "DEAD-CLICK RATE DISTRIBUTION (sessions with at least 10 clicks): why is P90 exactly 1.0?")
+    say("  The struggle penalty needs click_count >= 10 AND dead_click_rate > the day's P90. The calibration takes P90 over")
+    say("  intent_repository.fetch_dead_click_rates_for_date: ALL sessions of the day with >= 10 clicks, bots and unscored")
+    say("  ones included. (A rate can never exceed 1.0, so if P90 is 1.0 the rule cannot fire.)")
+    thresholds = q.optional("SELECT score_date, p90_dead_click_rate FROM intent_thresholds_daily WHERE score_date BETWEEN %s AND %s ORDER BY score_date DESC",
+                            (day - timedelta(days=4), day))
+    say("  stored P90 dead-click rate:")
+    show(thresholds)
+    for label, extra in (("all sessions with >= 10 clicks (what the calibration reads)", ""),
+                         ("excluding bots and zero-signal (what the scoring actually penalises)",
+                          "AND (intent_exclusion_reason IS NULL OR intent_exclusion_reason NOT IN ('bot', 'zero_signal'))")):
+        rows = q.rows(f"SELECT click_count, dead_click_count FROM intent_sessions WHERE session_start >= %s AND session_start < %s "
+                      f"AND click_count >= 10 AND session_time_spent_ms IS NOT NULL {extra} LIMIT %s", (start, end, MAX_SCORES))
+        rates = [min(1.0, (int(r["dead_click_count"] or 0) / int(r["click_count"]))) for r in rows if int(r["click_count"] or 0) > 0]
+        summary = dead_click_summary(rates)
+        say(f"  {label}: {summary.get('count', 0)} sessions")
+        if summary.get("count"):
+            table([(k, summary[k]) for k in ("P50", "P75", "P90", "P95", "P99", "max", "above_p90", "at_or_above_p90")])
+            show(summary["buckets"])
+    say("  bots among the >= 10-click sessions:")
+    show(q.rows("SELECT COALESCE(intent_exclusion_reason, '(not excluded)') AS reason, COUNT(*) AS sessions, "
+                "100 * AVG(dead_click_count = click_count) AS pct_all_dead FROM intent_sessions WHERE session_start >= %s "
+                "AND session_start < %s AND click_count >= 10 GROUP BY 1 ORDER BY 2 DESC", (start, end)))
+
+
+def canonical_reconciliation(q: Reader, start: datetime, end: datetime, day: date, deep: bool) -> None:
+    heading(21, "CANONICAL SESSION RECONCILIATION (one definition: a session is a row of intent_sessions, or an open record)")
+    row = q.one("SELECT COUNT(*) AS closed, SUM(intent_status = 'scored') AS scored, SUM(intent_status = 'pending') AS pending, "
+                "SUM(intent_status = 'excluded') AS excluded, SUM(intent_exclusion_reason = 'bot') AS bots, "
+                "SUM(intent_exclusion_reason = 'zero_signal') AS zero_signal, "
+                "SUM((intent_exclusion_reason IS NULL OR intent_exclusion_reason <> 'bot') AND session_time_spent_ms IS NOT NULL) AS distribution "
+                "FROM intent_sessions WHERE session_start >= %s AND session_start < %s", (start, end))
+    open_row = q.optional("SELECT COUNT(*) AS n FROM intent_actor_cursors WHERE session_id <> '' AND last_event_at >= %s "
+                          "AND last_event_at <= UTC_TIMESTAMP() + INTERVAL 14 HOUR AND session_start >= %s AND session_start < %s",
+                          (start, start, end))
+    rollup = q.optional("SELECT sessions, sessions_started FROM intent_daily_summary WHERE summary_date = %s", (day,))
+    numbers = {k: (int(v) if v is not None else None) for k, v in row.items()}
+    numbers["open"] = int(open_row[0]["n"]) if open_row else 0
+    numbers["rollup"] = int(rollup[0]["sessions_started"]) if rollup and rollup[0]["sessions_started"] is not None else None
+    show(reconciliation_report(numbers))
+    if rollup:
+        say(f"  rollup row: sessions={rollup[0]['sessions']} sessions_started={rollup[0]['sessions_started']} "
+            f"(sessions_started should equal closed + open as of the last rollup run)")
+    if deep:
+        say("  sessions of the day that have NO row in behavioral_events (click-only or scroll-only sessions), the old events-based count missed them:")
+        show(q.optional("SELECT COUNT(*) AS sessions_without_behavioral_events FROM intent_sessions s WHERE s.session_start >= %s AND s.session_start < %s "
+                        "AND NOT EXISTS (SELECT 1 FROM behavioral_events e WHERE e.session_id = s.session_id AND e.occurred_at >= %s)", (start, end, start)))
+    else:
+        say("  (add --deep to also count sessions that have no behavioral_events row; it does one lookup per session)")
 
 
 def duplicates(q: Reader, start: datetime, end: datetime) -> None:
@@ -507,7 +646,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--clarity", default=",".join(str(v) for v in CLARITY_DEFAULT),
                         help="Clarity low,medium,high percentages to compare with (default %(default)s)")
     parser.add_argument("--clarity-sessions", type=int, default=None, help="Clarity's session count for the day (e.g. 12251)")
+    parser.add_argument("--only", default=None, help="run only these section numbers, e.g. 10,18,19 (default: all)")
+    parser.add_argument("--deep", action="store_true", help="also run the lookups that cost one read per session (section 21)")
     args = parser.parse_args(argv)
+    try:
+        args.only_sections = {int(n) for n in args.only.split(",") if n.strip()} if args.only else None
+    except ValueError:
+        parser.error("--only needs section numbers like 10,18,19")
     try:
         args.clarity_values = tuple(float(v) for v in args.clarity.split(","))
         if len(args.clarity_values) != 3:
@@ -532,23 +677,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             pass
         q = Reader(cursor)
         say(f"intent diagnostics: brand={args.brand} (index {index}) day={args.date}  (read-only)")
-        reconciliation(q, start, end, args.date)
-        behaviour_levels(q, start, end)
-        score_view(q, start, end, args.date, args.score_table)
-        buckets(q, start, end)
-        cohorts(q, start, end)
-        features_by_bucket(q, start, end)
-        bounce_rule(q, start, end)
-        clicks(q, start, end)
-        page_types_and_overrides(q, start, end)
-        freshness(q)
-        duplicates(q, start, end)
-        score_vs_clarity(q, start, end, args.clarity_values, args.clarity_sessions)
-        feature_table(q, start, end)
-        engagement_cohorts(q, start, end)
-        product_view_duplication(q, start, end)
-        bounce_impact(q, start, end)
-        override_impact(q, start, end)
+        steps = [
+            (1, lambda: reconciliation(q, start, end, args.date)),
+            (2, lambda: behaviour_levels(q, start, end)),
+            (3, lambda: score_view(q, start, end, args.date, args.score_table)),
+            (4, lambda: buckets(q, start, end)),
+            (5, lambda: cohorts(q, start, end)),
+            (6, lambda: features_by_bucket(q, start, end)),
+            (7, lambda: bounce_rule(q, start, end)),
+            (8, lambda: clicks(q, start, end)),
+            (9, lambda: page_types_and_overrides(q, start, end)),
+            (10, lambda: freshness(q, start)),
+            (11, lambda: duplicates(q, start, end)),
+            (12, lambda: score_vs_clarity(q, start, end, args.clarity_values, args.clarity_sessions)),
+            (13, lambda: feature_table(q, start, end)),
+            (14, lambda: engagement_cohorts(q, start, end)),
+            (15, lambda: product_view_duplication(q, start, end)),
+            (16, lambda: bounce_impact(q, start, end)),
+            (17, lambda: override_impact(q, start, end)),
+            (18, lambda: scoring_backlog(q, start)),
+            (19, lambda: event_census(q, start, end)),
+            (20, lambda: dead_click_distribution(q, start, end, args.date)),
+            (21, lambda: canonical_reconciliation(q, start, end, args.date, args.deep)),
+        ]
+        for number, run in steps:
+            if args.only_sections is None or number in args.only_sections:
+                run()
     say()
     say("done. Paste the whole output back to continue the investigation.")
     return 0

@@ -10,7 +10,7 @@ import os
 import time
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pipeline.state import logger
 from intent_engine.config import SCORE_VERSION
@@ -107,11 +107,14 @@ def score_window_for_brand(
         if not sessions:
             break
         total += len(sessions)
-        touched |= score_sessions(
+        actors, failed = score_sessions_isolated(
             cursor, connection, sessions, now, read_cursor=read_cursor,
             label=f"range={window_start}..{window_end} page_end={sessions[-1].get('updated_at')}",
-            started_at=time.monotonic(),
         )
+        touched |= actors
+        if failed:
+            logger.warning("[intent scoring] category=scoring_page_partial range=%s..%s sessions_failed=%s "
+                           "(they stay pending; the rest of the page was scored)", window_start, window_end, len(failed))
         if len(sessions) < page_size:
             break
         last = sessions[-1]
@@ -132,15 +135,65 @@ def _window_page_size() -> int:
         return 2000
 
 
+# Errors that mean "the connection is gone", not "this session's data is bad": retrying session by session
+# would only repeat the same failure for every one of them, so they are raised straight away.
+_CONNECTION_ERRNOS = {2006, 2013, 2055}
+
+
+def score_sessions_isolated(
+    cursor, connection, sessions: List[Dict[str, Any]], now: datetime, read_cursor=None,
+    label: str = "", stats: Optional[Dict[str, int]] = None,
+) -> Tuple[Set[str], List[str]]:
+    """score_sessions with a failure that cannot block the rest. The whole page is tried first. If it raises
+    (a session whose data cannot be scored, a write the database rejects), the page is split in half and each
+    half retried, down to single sessions, so only the sessions that really fail are left out. They stay
+    `pending` and are returned (with the actors of all the others) so the caller can log them. Scoring is an
+    idempotent UPDATE by session_id, so a session scored in a half that is retried is simply written again with
+    the same values. A lost connection is not retried per session; it is raised."""
+    if stats is None:
+        stats = {}
+    for key in ("scored", "excluded", "failed"):
+        stats.setdefault(key, 0)
+
+    def attempt(group: List[Dict[str, Any]]) -> Tuple[Set[str], List[str]]:
+        part: Dict[str, int] = {}
+        try:
+            actors = score_sessions(cursor, connection, group, now, read_cursor=read_cursor, label=label, stats=part)
+        except Exception as exc:
+            if getattr(exc, "errno", None) in _CONNECTION_ERRNOS or isinstance(exc, (ConnectionError, TimeoutError)):
+                raise
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+            if len(group) == 1:
+                session_id = group[0].get("session_id")
+                logger.error("[intent scoring] category=scoring_session_failed session_id=%s %s: %s",
+                             session_id, type(exc).__name__, str(exc)[:200])
+                return set(), [session_id]
+            middle = len(group) // 2
+            left_actors, left_failed = attempt(group[:middle])
+            right_actors, right_failed = attempt(group[middle:])
+            return left_actors | right_actors, left_failed + right_failed
+        stats["scored"] += part.get("scored", 0)
+        stats["excluded"] += part.get("excluded", 0)
+        return actors, []
+
+    actors, failed = attempt(list(sessions))
+    stats["failed"] += len(failed)
+    return actors, failed
+
+
 def score_sessions(
     cursor, connection, sessions: List[Dict[str, Any]], now: datetime, read_cursor=None,
-    label: str = "", started_at: float = None,
+    label: str = "", started_at: float = None, stats: Optional[Dict[str, int]] = None,
 ) -> Set[str]:
     """
     Scores an explicit list of eligible sessions (rows shaped like fetch_eligible_sessions
     returns) and writes the results through `cursor`. Used by the windowed scoring pass and
     by the startup catch-up of pending sessions. Pure reads use `read_cursor` when given.
-    Returns the actor_ids touched, for actor_scorer.recompute_actors.
+    Returns the actor_ids touched, for actor_scorer.recompute_actors. `stats`, if given, receives the number of
+    sessions `scored` and `excluded`.
     """
     started_at = started_at if started_at is not None else time.monotonic()
     reader = read_cursor if read_cursor is not None else cursor
@@ -206,15 +259,21 @@ def score_sessions(
     upserted = bulk_update_scored_sessions(cursor, connection, scored_rows)
     excluded_count = bulk_update_excluded_sessions(cursor, connection, excluded_rows)
 
+    if stats is not None:
+        stats["scored"] = stats.get("scored", 0) + upserted
+        stats["excluded"] = stats.get("excluded", 0) + excluded_count
+
     duration = time.monotonic() - started_at
     logger.info(
         "[intent scoring] %s duration=%.2fs sessions_loaded=%s "
-        "scored=%s excluded=%s low=%s medium=%s high=%s score_version=%s",
+        "scored=%s excluded=%s low=%s medium=%s high=%s score_version=%s "
+        "scoring_batch_size=%s scoring_duration_ms=%s sessions_per_second=%.1f",
         label, duration, len(sessions), upserted, excluded_count,
         sum(1 for r in scored_rows if r[1] == "low"),
         sum(1 for r in scored_rows if r[1] == "medium"),
         sum(1 for r in scored_rows if r[1] == "high"),
         SCORE_VERSION,
+        len(sessions), int(duration * 1000), (len(sessions) / duration) if duration > 0 else 0.0,
     )
 
     return affected_actor_ids

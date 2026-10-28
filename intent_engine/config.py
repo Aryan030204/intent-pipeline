@@ -96,6 +96,14 @@ SCORING_METADATA_KEY = "intent_scoring_last_processed_at"
 SCORING_OVERLAP = timedelta(hours=1)
 SCORING_DEFAULT_LOOKBACK = timedelta(hours=6)
 
+# The pending-session drain (the startup catch-up and its recurring job in workers/intent_scoring_worker.py).
+# It looks for pending sessions that started in the last SCORING_PENDING_LOOKBACK_DAYS days, newest first, and
+# stops after SCORING_DRAIN_BUDGET_S seconds per brand so it never holds the scoring lock for hours; the next
+# run carries on. INTENT_SCORING_PENDING_LOOKBACK_DAYS / INTENT_SCORING_CATCHUP_BUDGET_S override them.
+SCORING_PENDING_LOOKBACK_DAYS = 45
+SCORING_DRAIN_BUDGET_S = 1200
+SCORING_PENDING_COUNT_CAP = 100000
+
 # Calibration has no watermark of its own: it always targets a single
 # computed date ("yesterday, IST") on a fixed daily cron, and
 # intent_thresholds_daily itself is the record of what's already been done.

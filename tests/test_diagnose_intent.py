@@ -75,6 +75,58 @@ def test_arguments():
     assert args.clarity_values == (42.87, 44.77, 12.36) and args.clarity_sessions is None
 
 
+def test_the_dead_click_summary_shows_when_p90_is_the_maximum():
+    # 30 sessions fully dead out of 100: P90 lands on 1.0, so "above P90" is empty and "at or above" is not
+    rates = [0.0] * 20 + [0.5] * 50 + [1.0] * 30
+    summary = d.dead_click_summary(rates)
+    assert summary["count"] == 100 and summary["P90"] == 1.0 and summary["max"] == 1.0
+    assert summary["above_p90"] == 0 and summary["at_or_above_p90"] == 30
+    shares = {b["dead_click_rate"]: b["sessions"] for b in summary["buckets"]}
+    assert shares["0% dead"] == 20 and shares["exactly 100% dead"] == 30
+    assert sum(shares.values()) == 100                                  # every session is in exactly one bucket
+
+
+def test_the_dead_click_summary_with_a_p90_below_one():
+    summary = d.dead_click_summary([0.1] * 95 + [1.0] * 5)
+    assert summary["P90"] == 0.1 and summary["above_p90"] == 5
+    assert d.dead_click_summary([]) == {"count": 0}
+
+
+def test_the_reconciliation_report_gives_each_figure_and_its_difference_from_the_canonical_total():
+    rows = d.reconciliation_report({"closed": 12378, "open": 40, "scored": 6, "pending": 12371, "excluded": 1, "bots": 0,
+                                    "zero_signal": 1, "distribution": 12378, "rollup": 12228})
+    by = {r["figure"]: r for r in rows}
+    assert by["canonical sessions (closed rows + open)"]["sessions"] == 12418
+    assert by["closed rows in intent_sessions"]["diff_from_canonical"] == -40
+    assert by["rollup sessions_started"]["diff_from_canonical"] == 12228 - 12418
+    assert "MISMATCH" not in by["scored + pending + excluded"]["note"]
+    mismatch = d.reconciliation_report({"closed": 100, "open": 0, "scored": 50, "pending": 40, "excluded": 5})
+    assert "MISMATCH: -5" in {r["figure"]: r for r in mismatch}["scored + pending + excluded"]["note"]
+
+
+def test_the_reconciliation_report_tolerates_missing_numbers():
+    rows = d.reconciliation_report({})
+    assert rows[0]["sessions"] == 0 and all(r["sessions"] in (0, None) for r in rows)
+
+
+def test_sections_can_be_selected_and_the_selection_is_validated():
+    assert d.parse_args(["--brand", "BBB", "--date", "2026-10-28"]).only_sections is None
+    assert d.parse_args(["--brand", "BBB", "--date", "2026-10-28", "--only", "10, 18,19"]).only_sections == {10, 18, 19}
+    try:
+        d.parse_args(["--brand", "BBB", "--date", "2026-10-28", "--only", "x"])
+    except SystemExit:
+        return
+    raise AssertionError("--only x should be rejected")
+
+
+def test_the_freshness_queries_never_scan_a_whole_table():
+    import inspect
+
+    source = inspect.getsource(d.freshness)
+    assert "MAX(ingested_at)" not in source and "MAX(updated_at)" not in source           # unindexed columns: full scans
+    assert "ORDER BY id DESC LIMIT 1" in source and "session_start >=" in source
+
+
 def test_the_clarity_numbers_can_be_given_and_are_validated():
     ok = d.parse_args(["--brand", "BBB", "--date", "2026-10-28", "--clarity", "40,45,15", "--clarity-sessions", "12251"])
     assert ok.clarity_values == (40.0, 45.0, 15.0) and ok.clarity_sessions == 12251

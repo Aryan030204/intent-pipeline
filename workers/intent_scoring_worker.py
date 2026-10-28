@@ -53,7 +53,8 @@ if PROJECT_ROOT not in sys.path:
 import aws_background  # noqa: F401  (see module docstring)
 
 from intent_engine.runner import (
-    run_intent_scoring_catchup, run_intent_scoring_pipeline, run_intent_calibration_pipeline,
+    run_intent_scoring_catchup, run_intent_scoring_drain, run_intent_scoring_pipeline,
+    run_intent_calibration_pipeline,
 )
 
 
@@ -76,6 +77,7 @@ def _run_migrations() -> None:
 # sessions already written, so the minute does not change what it scores.
 SCORING_CRON_MINUTE = 27
 CALIBRATION_CRON_MINUTE = 10
+DRAIN_CRON_MINUTES = "12,42"      # twice an hour, away from the scoring (:27) and rollup (:00/:15/:30/:45) ticks
 STARTUP_DELAY_S = max(0, int(os.environ.get("INTENT_SCORING_STARTUP_DELAY_S", "210") or 0))
 _IST = ZoneInfo("Asia/Kolkata")
 # One heavy pass at a time inside this process (startup runs, scheduled scoring, calibration).
@@ -102,6 +104,13 @@ def _scoring_job() -> None:
 
 def _calibration_job() -> None:
     _locked(run_intent_calibration_pipeline, "intent calibration")
+
+
+def _drain_job() -> None:
+    # Keeps working off any pending sessions (newest first, a bounded time per run) between the 2-hourly passes, so
+    # a backlog drains continuously instead of waiting for the next pass or for a restart. Skips when another heavy
+    # pass is running; the next tick carries on.
+    _locked(run_intent_scoring_drain, "intent scoring drain")
 
 
 def _startup_runs() -> None:
@@ -156,6 +165,16 @@ def _run_scheduled() -> None:
         minute=SCORING_CRON_MINUTE,
         second=0,
         id="intent_scoring_job",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+    scheduler.add_job(
+        _drain_job,
+        "cron",
+        minute=DRAIN_CRON_MINUTES,
+        second=0,
+        id="intent_scoring_drain",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=600,

@@ -239,6 +239,55 @@ def fetch_pending_sessions(
     return cursor.fetchall()
 
 
+def fetch_pending_sessions_by_start(
+    cursor, since: datetime, limit: int, before: Optional[Tuple[datetime, int]] = None,
+) -> List[Dict[str, Any]]:
+    """Closed sessions still `pending` that started at or after `since`, NEWEST first, in pages of at most
+    `limit`. `before` is the (session_start, id) of the last row of the previous page.
+
+    Pages by (session_start, id), which is exactly idx_session_start (a secondary index carries the primary key),
+    so no extra index is needed and nothing is sorted: the page is read straight off the index, newest day first.
+    The updated_at paging of fetch_pending_sessions needs an index that the table does not have by default and
+    sorts the whole pending range for every page without it. Each row also carries `id` for that key."""
+    columns_sql = ", ".join(_ELIGIBLE_SESSION_COLUMNS)
+    sql = f"""
+        SELECT {columns_sql}, id
+        FROM intent_sessions
+        WHERE session_start >= %s
+              AND intent_status = 'pending'
+              AND session_time_spent_ms IS NOT NULL
+    """
+    params: List[Any] = [since]
+    if before is not None:
+        sql += " AND (session_start < %s OR (session_start = %s AND id < %s))"
+        params += [before[0], before[0], before[1]]
+    sql += " ORDER BY session_start DESC, id DESC LIMIT %s"
+    params.append(int(limit))
+    cursor.execute(sql, tuple(params))
+    return cursor.fetchall()
+
+
+def count_pending_sessions(cursor, since: datetime, cap: int = 100000) -> int:
+    """How many closed sessions are still pending since `since`, counted up to `cap` (a bounded read, never a
+    table-wide count)."""
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM (SELECT 1 FROM intent_sessions WHERE session_start >= %s "
+        "AND intent_status = 'pending' AND session_time_spent_ms IS NOT NULL LIMIT %s) pending",
+        (since, int(cap)),
+    )
+    row = cursor.fetchone()
+    return int((row["n"] if isinstance(row, dict) else row[0]) or 0) if row else 0
+
+
+def updated_at_index_present(cursor) -> bool:
+    """Whether intent_sessions has an index that starts with updated_at (the windowed scoring pass filters on it)."""
+    cursor.execute(
+        "SELECT 1 AS present FROM information_schema.statistics WHERE table_schema = DATABASE() "
+        "AND table_name = 'intent_sessions' AND column_name = 'updated_at' AND seq_in_index = 1 LIMIT 1"
+    )
+    return bool(cursor.fetchall())
+
+
 def _legacy_fetch_page_viewed_enrichment(cursor, session_ids: Sequence[str]) -> List[Dict[str, Any]]:
     """The original query: one row per page_viewed event, with its full url and user agent."""
     if not session_ids:
