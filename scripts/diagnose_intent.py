@@ -214,7 +214,7 @@ def behaviour_levels(q: Reader, start: datetime, end: datetime) -> None:
     show(levels)
     say("  why LOW (a session can be both):")
     show(q.rows("SELECT SUM(session_time_spent_ms < 5000) AS under_5s, SUM(click_count = 0 AND scroll_count = 0) AS no_click_no_scroll, "
-                "SUM(session_time_spent_ms < 5000 AND click_count = 0 AND scroll_count = 0) AS both, "
+                "SUM(session_time_spent_ms < 5000 AND click_count = 0 AND scroll_count = 0) AS both_conditions, "
                 "SUM(event_count = 1) AS single_event_sessions FROM intent_sessions WHERE session_start >= %s AND session_start < %s "
                 "AND session_time_spent_ms IS NOT NULL AND (intent_exclusion_reason IS NULL OR intent_exclusion_reason <> 'bot')", (start, end)))
     say("  MEDIUM (5 s or more, some interaction, no key action) split:")

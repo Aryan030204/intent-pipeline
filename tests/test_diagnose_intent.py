@@ -53,6 +53,22 @@ def test_the_behaviour_rule_text_matches_the_dashboard_rule():
     assert "click_count > 0 AND (product_view_count > 0 OR add_to_cart_count > 0 OR checkout_started_count > 0) THEN 'high'" in flat
 
 
+def test_no_sql_alias_in_the_script_is_a_mysql_reserved_word():
+    # MySQL rejects `... AS both` (1064): `both` belongs to TRIM(BOTH ...). Catch the whole class of mistakes.
+    import re
+
+    reserved = {"both", "leading", "trailing", "group", "order", "rank", "rows", "row", "window", "groups", "lead", "lag", "system",
+                "function", "condition", "current", "key", "keys", "match", "read", "rename", "replace", "repeat", "range", "release",
+                "show", "index", "interval", "left", "right", "limit", "lock", "long", "option", "or", "and", "not", "outer", "primary",
+                "procedure", "purge", "select", "from", "where", "having", "cube", "dense_rank", "first_value", "last_value", "over",
+                "partition", "recursive", "usage", "use", "when", "then", "case", "end", "else", "if", "in", "is", "like", "null",
+                "true", "false", "table", "to", "unique", "values", "with", "write", "xor", "zerofill", "year_month"}
+    datatypes = {"char", "signed", "unsigned", "decimal", "date", "datetime", "time"}
+    with open(d.__file__, encoding="utf-8") as handle:
+        aliases = set(re.findall(r"\sAS\s+([A-Za-z_][A-Za-z0-9_]*)", handle.read()))
+    assert not ((aliases - datatypes) & reserved), sorted((aliases - datatypes) & reserved)
+
+
 def test_arguments():
     args = d.parse_args(["--brand", "BBB", "--date", "2026-10-28", "--score-table"])
     assert str(args.date) == "2026-10-28" and args.score_table is True
