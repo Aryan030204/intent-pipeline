@@ -11,6 +11,9 @@ per-brand aggregate tables for dashboard consumption:
     product_behavior_daily - grain: date + product_id
     behavioral_path_daily  - grain: date + sequence_hash
 
+and a sixth, heatmap_page_daily (grain: date + page_path + device), behind the dashboard's Heatmaps
+"popular pages" list.
+
 This module does NOT touch Mongo and does NOT modify raw ingestion. It is
 purely a read-from-MySQL / upsert-to-MySQL stage, invoked after ingestion
 by pipeline/orchestration.py.
@@ -246,12 +249,32 @@ def _ensure_behavioral_path_daily_table(cursor, connection) -> None:
     connection.commit()
 
 
+def _ensure_heatmap_page_daily_table(cursor, connection) -> None:
+    # Same definition as analytics/scripts/heatmap-pages-rollup.cjs (which stays for back-filling old days).
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS heatmap_page_daily (
+            summary_date DATE NOT NULL,
+            page_path VARCHAR(255) NOT NULL,
+            device_type VARCHAR(10) NOT NULL,
+            page_views INT UNSIGNED NOT NULL DEFAULT 0,
+            sessions INT UNSIGNED NOT NULL DEFAULT 0,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (summary_date, page_path, device_type),
+            KEY idx_page_date (page_path, summary_date)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """
+    )
+    connection.commit()
+
+
 def _ensure_all_rollup_tables(cursor, connection) -> None:
     _ensure_intent_daily_summary_table(cursor, connection)
     _ensure_page_behavior_daily_table(cursor, connection)
     _ensure_click_behavior_daily_table(cursor, connection)
     _ensure_product_behavior_daily_table(cursor, connection)
     _ensure_behavioral_path_daily_table(cursor, connection)
+    _ensure_heatmap_page_daily_table(cursor, connection)
 
 
 # ---------------------------
@@ -1363,6 +1386,90 @@ def _rollup_behavioral_path_daily(cursor, connection, dates: List[date], source:
 
 
 # ---------------------------
+# Rollup 6: heatmap_page_daily
+# ---------------------------
+# Page views per day, page path and device, for the Heatmaps "popular pages" list. Page paths use the same
+# normalisation as page_behavior_daily / click_behavior_daily, so a page chosen in the list finds its clicks.
+# The device comes from the user agent, which the temporary event copy does not carry, so this stage always
+# reads behavioral_events itself (page_viewed events only: the (event_name, occurred_at) index covers it).
+# INTENT_HEATMAP_ROLLUP=off switches the stage off.
+_HEATMAP_DEVICE_CASE_SQL = """CASE
+            WHEN user_agent LIKE '%%iPad%%' OR user_agent LIKE '%%Tablet%%'
+              OR (user_agent LIKE '%%Android%%' AND user_agent NOT LIKE '%%Mobile%%') THEN 'tablet'
+            WHEN user_agent LIKE '%%iPhone%%' OR user_agent LIKE '%%Android%%' OR user_agent LIKE '%%Mobile%%' THEN 'mobile'
+            ELSE 'desktop'
+        END"""
+
+
+def _heatmap_rollup_enabled() -> bool:
+    return os.environ.get("INTENT_HEATMAP_ROLLUP", "on").strip().lower() not in ("off", "false", "0", "no")
+
+
+def _rollup_heatmap_page_daily(cursor, connection, dates: List[date], source: Optional[_Source] = None) -> Dict[str, int]:
+    if not _heatmap_rollup_enabled():
+        return {"scanned": 0, "generated": 0, "upserted": 0, "deleted": 0}
+    started_at = time.monotonic()
+    range_start, range_end = _window_bounds(dates)
+
+    cursor.execute(
+        f"""
+        SELECT
+            DATE(occurred_at) AS d,
+            SUBSTRING_INDEX(SUBSTRING_INDEX(url, '?', 1), '#', 1) AS raw_path,
+            {_HEATMAP_DEVICE_CASE_SQL} AS device_type,
+            COUNT(*) AS page_views,
+            COUNT(DISTINCT session_id) AS sessions
+        FROM behavioral_events
+        WHERE event_name = 'page_viewed'
+          AND occurred_at >= %s AND occurred_at < %s
+          AND url IS NOT NULL AND url <> ''
+        GROUP BY DATE(occurred_at), raw_path, device_type
+        """,
+        (range_start, range_end),
+    )
+    fetched = cursor.fetchall()
+    scanned = sum(int(r["page_views"] or 0) for r in fetched)
+
+    # Different raw paths can normalise to the same page ("/a" and "/a/"): their counts add up. Sessions are
+    # summed the same way page_behavior_daily sums its unique sessions.
+    merged: Dict[Tuple[date, str, str], List[int]] = {}
+    for r in fetched:
+        path = _normalize_page_path(r["raw_path"])
+        if path == "(unknown)":
+            continue
+        counts = merged.setdefault((r["d"], path, r["device_type"]), [0, 0])
+        counts[0] += int(r["page_views"] or 0)
+        counts[1] += int(r["sessions"] or 0)
+
+    rows: List[Tuple] = []
+    computed_keys_by_date: Dict[date, Set[Tuple]] = {d: set() for d in dates}
+    for (target_date, path, device), (views, sessions) in merged.items():
+        if target_date not in computed_keys_by_date:
+            continue
+        rows.append((target_date, path, device, views, sessions))
+        computed_keys_by_date[target_date].add((path, device))
+
+    insert_sql = """
+        INSERT INTO heatmap_page_daily (summary_date, page_path, device_type, page_views, sessions)
+        VALUES (%s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            page_views = VALUES(page_views),
+            sessions = VALUES(sessions)
+    """
+    upserted, deleted = _upsert_rollup_rows(
+        cursor, connection, "heatmap_page_daily", insert_sql, rows,
+        ["summary_date", "page_path", "device_type"], dates, computed_keys_by_date,
+    )
+
+    logger.info(
+        "[rollup heatmap_page_daily] range=%s..%s duration=%.2fs rows_scanned=%s rows_generated=%s "
+        "rows_upserted=%s rows_deleted_stale=%s",
+        range_start, range_end, time.monotonic() - started_at, scanned, len(rows), upserted, deleted,
+    )
+    return {"scanned": scanned, "generated": len(rows), "upserted": upserted, "deleted": deleted}
+
+
+# ---------------------------
 # Orchestration entrypoint
 # ---------------------------
 _ROLLUP_STAGES = (
@@ -1371,6 +1478,7 @@ _ROLLUP_STAGES = (
     ("click_behavior_daily", _rollup_click_behavior_daily),
     ("product_behavior_daily", _rollup_product_behavior_daily),
     ("behavioral_path_daily", _rollup_behavioral_path_daily),
+    ("heatmap_page_daily", _rollup_heatmap_page_daily),
 )
 
 
