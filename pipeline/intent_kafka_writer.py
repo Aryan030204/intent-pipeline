@@ -32,6 +32,7 @@ from pipeline.intent_session_state import (
     DEFAULT_SESSION_TIMEOUT_S,
     ActorCursor,
     commit_event,
+    first_utm_source,
     new_session_id,
     resolve_timing,
 )
@@ -98,7 +99,9 @@ def _event_row(message: IntentMessage, session_id: str, actor_id: Optional[str])
 
 def _closed_session_row(doc: Dict[str, Any]) -> tuple:
     row = _require(_extract_session_history_row(doc), "closed session")
-    return tuple(row[:-1])  # the trailing updatedAt is not a column
+    # the trailing updatedAt is not a column; the session's first utm_source is the last value (the store drops
+    # it again for a database that does not have intent_sessions.first_utm_source yet)
+    return tuple(row[:-1]) + (first_utm_source(doc.get("events_seq")),)
 
 
 def _apply_one(store, item: WorkItem, actor_id: Optional[str], cursor: Optional[ActorCursor],

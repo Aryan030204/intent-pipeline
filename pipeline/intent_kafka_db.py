@@ -20,6 +20,7 @@ from pipeline.db import get_db_connection, get_db_cursor
 from pipeline.intent_kafka_store import (
     MySqlIntentStore,
     assert_rowcount_semantics,
+    first_utm_column_present,
     utm_columns_present,
     verify_schema,
 )
@@ -34,6 +35,7 @@ class BrandConnections:
         self._clock = clock
         self._open: Dict[int, Tuple[object, object]] = {}  # brand_index -> (context manager, connection)
         self._utm: Dict[int, Tuple[float, bool]] = {}      # brand_index -> (checked at, has the utm_* columns)
+        self._first_utm: Dict[int, Tuple[float, bool]] = {}  # brand_index -> (checked at, has first_utm_source)
 
     def _has_utm(self, brand_index: int, cursor) -> bool:
         """Whether this brand's event tables have the utm_* columns. A database that has them is not asked
@@ -51,6 +53,23 @@ class BrandConnections:
         if present and (cached is None or not cached[1]):
             logger.info(f"[intent-kafka] category=utm_columns_present brand_index={brand_index} storing UTM values")
         self._utm[brand_index] = (self._clock(), present)
+        return present
+
+    def _has_first_utm(self, brand_index: int, cursor) -> bool:
+        """Whether intent_sessions has first_utm_source; checked the same way as _has_utm (a database that has it is
+        not asked again, one that does not is re-checked every UTM_RECHECK_S). A failed check writes sessions without
+        it: the value can be filled in later with scripts/backfill_first_utm.py."""
+        cached = self._first_utm.get(brand_index)
+        if cached is not None and (cached[1] or self._clock() - cached[0] < UTM_RECHECK_S):
+            return cached[1]
+        try:
+            present = first_utm_column_present(cursor)
+        except Exception as exc:
+            logger.warning(f"[intent-kafka] category=first_utm_check_failed brand_index={brand_index} {type(exc).__name__}: {exc}")
+            present = False
+        if present and (cached is None or not cached[1]):
+            logger.info(f"[intent-kafka] category=first_utm_column_present brand_index={brand_index} storing first utm source")
+        self._first_utm[brand_index] = (self._clock(), present)
         return present
 
     def _connection(self, brand_index: int):
@@ -92,7 +111,11 @@ class BrandConnections:
         connection = self._connection(brand_index)
         cursor = connection.cursor(dictionary=True, buffered=True)
         try:
-            yield MySqlIntentStore(cursor, utm=self._has_utm(brand_index, cursor))
+            yield MySqlIntentStore(
+                cursor,
+                utm=self._has_utm(brand_index, cursor),
+                first_utm=self._has_first_utm(brand_index, cursor),
+            )
             connection.commit()
         except BaseException:
             try:

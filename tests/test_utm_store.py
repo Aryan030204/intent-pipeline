@@ -200,6 +200,7 @@ def test_the_verify_schema_warning_names_the_missing_columns(monkeypatch):
                 self._rows = [{"name": t} for t in sorted(REQUIRED_COLUMNS)]
             elif "information_schema.columns" in lowered:
                 self._rows = [{"tbl": t, "col": c} for t, cols in REQUIRED_COLUMNS.items() for c in cols]
+                self._rows.append({"tbl": "intent_sessions", "col": "first_utm_source"})  # present: only the utm_* are missing
             else:
                 self._rows = ([{"tbl": "behavioral_events", "idx": "uq", "nu": 0, "col": "event_id"},
                                {"tbl": "click_events", "idx": "uq", "nu": 0, "col": "event_id"},

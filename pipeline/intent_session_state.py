@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
+from pipeline.utm import extract_utm
+
 DEFAULT_SESSION_TIMEOUT_S = 1800
 NEGATIVE_GAP_TOLERANCE_S = 30
 
@@ -75,7 +77,29 @@ def seq_entry(message) -> Dict[str, Any]:
         "click_bucket": message.click_bucket,
         "client_id": message.client_id,
         "visitor_id": message.visitor_id,
+        # the page URL's utm_source (None when the URL has none); the session's first one becomes
+        # intent_sessions.first_utm_source when the session closes (see first_utm_source below)
+        "utm_source": extract_utm(getattr(message, "url", None))[0],
     }
+
+
+def first_utm_source(events_seq: Optional[Dict[str, Dict[str, Any]]]) -> Optional[str]:
+    """The utm_source of the first event of the session that has one (its landing source), or None. Steps are
+    read in order; steps stored before utm_source was recorded simply have none."""
+    if not isinstance(events_seq, dict):
+        return None
+    steps = []
+    for key, entry in events_seq.items():
+        try:
+            steps.append((int(key), entry))
+        except (TypeError, ValueError):
+            continue
+    for _, entry in sorted(steps, key=lambda item: item[0]):
+        if isinstance(entry, dict):
+            value = entry.get("utm_source")
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:255]
+    return None
 
 
 def closed_session_doc(cursor: ActorCursor) -> Dict[str, Any]:
@@ -129,6 +153,7 @@ def commit_event(
 
 __all__ = [
     "ActorCursor",
+    "first_utm_source",
     "Timing",
     "DEFAULT_SESSION_TIMEOUT_S",
     "NEGATIVE_GAP_TOLERANCE_S",
