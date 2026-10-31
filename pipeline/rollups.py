@@ -249,6 +249,70 @@ def _ensure_behavioral_path_daily_table(cursor, connection) -> None:
     connection.commit()
 
 
+# behavioral_path_daily.first_event: the first event of a path ("page_viewed" in "page_viewed>click"), as its own
+# indexed column, so the dashboard's Funnel Exploration can ask "paths that start with X" from an index instead of
+# cutting every stored sequence apart with SUBSTRING_INDEX. Added to an existing table in place (a small rollup table,
+# so the ALTER is quick) and filled for older rows in bounded batches; every step is best effort: if it cannot be done
+# the rollup keeps writing the table without the column and the dashboard keeps using the sequence text.
+PATH_FIRST_EVENT_MAX_LEN = 100
+PATH_FIRST_EVENT_BACKFILL_BATCH = 5000
+PATH_FIRST_EVENT_BACKFILL_MAX_BATCHES = 50   # per process start; the rest is picked up at the next start
+
+
+def _ensure_index_exists(cursor, connection, table_name: str, index_name: str, columns_sql: str) -> None:
+    """Idempotent ADD KEY, the index counterpart of _ensure_column_exists."""
+    cursor.execute(f"SHOW INDEX FROM {table_name} WHERE Key_name = %s", (index_name,))
+    if cursor.fetchone() is not None:
+        return
+    cursor.execute(f"ALTER TABLE {table_name} ADD KEY {index_name} {columns_sql}")
+    connection.commit()
+
+
+def _backfill_path_first_event(cursor, connection) -> int:
+    """Fills first_event for rows that have none yet, a batch at a time (committed each time). Returns rows updated."""
+    total = 0
+    for _ in range(PATH_FIRST_EVENT_BACKFILL_MAX_BATCHES):
+        cursor.execute(
+            "UPDATE behavioral_path_daily SET first_event = LEFT(SUBSTRING_INDEX(sequence, '>', 1), %s) "
+            "WHERE first_event IS NULL LIMIT %s",
+            (PATH_FIRST_EVENT_MAX_LEN, PATH_FIRST_EVENT_BACKFILL_BATCH),
+        )
+        changed = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        connection.commit()
+        total += changed
+        if changed < PATH_FIRST_EVENT_BACKFILL_BATCH:
+            break
+    return total
+
+
+def _ensure_path_first_event(cursor, connection) -> None:
+    try:
+        _ensure_column_exists(cursor, connection, "behavioral_path_daily", "first_event", f"VARCHAR({PATH_FIRST_EVENT_MAX_LEN}) NULL")
+        _ensure_index_exists(cursor, connection, "behavioral_path_daily", "idx_first_event_date", "(first_event, summary_date)")
+        filled = _backfill_path_first_event(cursor, connection)
+        if filled:
+            logger.info("[rollup behavioral_path_daily] first_event filled for %s existing row(s)", filled)
+    except Exception as exc:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        logger.warning("[rollup behavioral_path_daily] first_event column not set up (%s: %s); paths keep using the "
+                       "sequence text", type(exc).__name__, str(exc)[:160])
+
+
+def _path_first_event_present(cursor) -> bool:
+    try:
+        cursor.execute("SHOW COLUMNS FROM behavioral_path_daily LIKE %s", ("first_event",))
+        return cursor.fetchone() is not None
+    except Exception:
+        return False
+
+
+def _first_event_of(sequence: str) -> str:
+    return str(sequence or "").split(">", 1)[0][:PATH_FIRST_EVENT_MAX_LEN]
+
+
 def _ensure_heatmap_page_daily_table(cursor, connection) -> None:
     # Same definition as analytics/scripts/heatmap-pages-rollup.cjs (which stays for back-filling old days).
     cursor.execute(
@@ -274,6 +338,7 @@ def _ensure_all_rollup_tables(cursor, connection) -> None:
     _ensure_click_behavior_daily_table(cursor, connection)
     _ensure_product_behavior_daily_table(cursor, connection)
     _ensure_behavioral_path_daily_table(cursor, connection)
+    _ensure_path_first_event(cursor, connection)
     _ensure_heatmap_page_daily_table(cursor, connection)
 
 
@@ -1272,6 +1337,7 @@ def _rollup_product_behavior_daily(cursor, connection, dates: List[date], source
 # ---------------------------
 def _rollup_behavioral_path_daily(cursor, connection, dates: List[date], source: Optional[_Source] = None) -> Dict[str, int]:
     started_at = time.monotonic()
+    has_first_event = _path_first_event_present(cursor)
     total_scanned = 0
     total_generated = 0
     total_upserted = 0
@@ -1344,11 +1410,12 @@ def _rollup_behavioral_path_daily(cursor, connection, dates: List[date], source:
         for sequence_hash, b in buckets.items():
             conversion_to_atc = _safe_div(b["sessions_with_atc"], b["session_count"])
             conversion_to_checkout = _safe_div(b["sessions_with_checkout"], b["session_count"])
-            rows.append((
+            row = (
                 target_date, sequence_hash, b["sequence"], b["session_count"],
                 len(b["unique_actors"]), b["sessions_with_atc"], b["sessions_with_checkout"],
                 conversion_to_atc, conversion_to_checkout,
-            ))
+            )
+            rows.append(row + (_first_event_of(b["sequence"]),) if has_first_event else row)
             computed_keys.add((sequence_hash,))
 
         insert_sql = """
@@ -1364,6 +1431,22 @@ def _rollup_behavioral_path_daily(cursor, connection, dates: List[date], source:
                 sessions_with_checkout = VALUES(sessions_with_checkout),
                 conversion_to_atc = VALUES(conversion_to_atc),
                 conversion_to_checkout = VALUES(conversion_to_checkout)
+        """
+        if has_first_event:
+            insert_sql = """
+            INSERT INTO behavioral_path_daily (
+                summary_date, sequence_hash, sequence, session_count, unique_actor_count,
+                sessions_with_atc, sessions_with_checkout, conversion_to_atc, conversion_to_checkout, first_event
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                sequence = VALUES(sequence),
+                session_count = VALUES(session_count),
+                unique_actor_count = VALUES(unique_actor_count),
+                sessions_with_atc = VALUES(sessions_with_atc),
+                sessions_with_checkout = VALUES(sessions_with_checkout),
+                conversion_to_atc = VALUES(conversion_to_atc),
+                conversion_to_checkout = VALUES(conversion_to_checkout),
+                first_event = VALUES(first_event)
         """
         upserted, deleted = _upsert_rollup_rows(
             cursor, connection, "behavioral_path_daily", insert_sql, rows,

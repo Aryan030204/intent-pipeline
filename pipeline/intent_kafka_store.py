@@ -83,7 +83,23 @@ CLICK_INSERT_SQL = _insert_noop_on_duplicate("click_events", _CLICK_EVENTS_UPSER
 EVENT_INSERT_SQL_NO_UTM = _insert_noop_on_duplicate("behavioral_events", _without_utm(_BEHAVIORAL_UPSERT_COLUMNS), "event_id")
 CLICK_INSERT_SQL_NO_UTM = _insert_noop_on_duplicate("click_events", _without_utm(_CLICK_EVENTS_UPSERT_COLUMNS), "event_id")
 ATC_CLAIM_SQL = _insert_noop_on_duplicate(ATC_TABLE, ("session_id", "product_id"), "session_id")
+# intent_sessions.first_utm_source (migrations/004_session_first_utm.sql) is the LAST value of a closed-session row.
+# A database without it is written without that last value, like the optional utm_* columns of the event tables, so a
+# pending migration never stops ingestion. When a session is written again and the new row has no source (a session
+# that was open before the source was recorded), the stored one is kept.
+FIRST_UTM_COLUMN = "first_utm_source"
+_SESSION_COLUMNS_WITH_FIRST_UTM = tuple(_INTENT_SESSIONS_UPSERT_COLUMNS) + (FIRST_UTM_COLUMN,)
+_SESSION_UPDATE_WITH_FIRST_UTM = ", ".join(
+    [f"{c} = VALUES({c})" for c in _INTENT_SESSIONS_UPDATE_COLUMNS]
+    + [f"{FIRST_UTM_COLUMN} = COALESCE(VALUES({FIRST_UTM_COLUMN}), {FIRST_UTM_COLUMN})"]
+)
 SESSION_UPSERT_SQL = (
+    f"INSERT INTO intent_sessions ({', '.join(_SESSION_COLUMNS_WITH_FIRST_UTM)}) "
+    f"VALUES ({', '.join(['%s'] * len(_SESSION_COLUMNS_WITH_FIRST_UTM))}) "
+    f"ON DUPLICATE KEY UPDATE {_SESSION_UPDATE_WITH_FIRST_UTM}"
+)
+# The same statement for a database without first_utm_source.
+SESSION_UPSERT_SQL_NO_FIRST_UTM = (
     f"INSERT INTO intent_sessions ({', '.join(_INTENT_SESSIONS_UPSERT_COLUMNS)}) "
     f"VALUES ({', '.join(['%s'] * len(_INTENT_SESSIONS_UPSERT_COLUMNS))}) "
     f"ON DUPLICATE KEY UPDATE {', '.join(f'{c} = VALUES({c})' for c in _INTENT_SESSIONS_UPDATE_COLUMNS)}"
@@ -159,6 +175,12 @@ def verify_schema(cursor) -> None:
                 f"without UTM values until migrations/003_event_utm_columns.sql is applied"
             )
 
+    if FIRST_UTM_COLUMN not in have["intent_sessions"]:
+        logger.warning(
+            f"[intent-kafka] category=first_utm_column_missing table=intent_sessions; sessions are stored without "
+            f"their first utm source until migrations/004_session_first_utm.sql is applied"
+        )
+
     cursor.execute(
         f"SELECT table_name AS tbl, index_name AS idx, non_unique AS nu, column_name AS col "
         f"FROM information_schema.statistics WHERE table_schema = DATABASE() "
@@ -194,6 +216,16 @@ def utm_columns_present(cursor) -> bool:
     )
     counts = {_cell(r, 0, "tbl"): int(_cell(r, 1, "n")) for r in cursor.fetchall()}
     return counts.get("behavioral_events") == UTM_COUNT and counts.get("click_events") == UTM_COUNT
+
+
+def first_utm_column_present(cursor) -> bool:
+    """True when intent_sessions of the connected database has the first_utm_source column."""
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'intent_sessions' AND column_name = %s",
+        (FIRST_UTM_COLUMN,),
+    )
+    return int(_cell(cursor.fetchall()[0], 0, "n")) > 0
 
 
 def migration_statements() -> List[str]:
@@ -237,7 +269,10 @@ LOCK_ACTORS_PER_QUERY = 500
 
 EVENT_TAIL = "ON DUPLICATE KEY UPDATE event_id = event_id"
 ATC_TAIL = "ON DUPLICATE KEY UPDATE session_id = session_id"
-SESSION_TAIL = "ON DUPLICATE KEY UPDATE " + ", ".join(f"{c} = VALUES({c})" for c in _INTENT_SESSIONS_UPDATE_COLUMNS)
+SESSION_TAIL_NO_FIRST_UTM = "ON DUPLICATE KEY UPDATE " + ", ".join(
+    f"{c} = VALUES({c})" for c in _INTENT_SESSIONS_UPDATE_COLUMNS
+)
+SESSION_TAIL = "ON DUPLICATE KEY UPDATE " + _SESSION_UPDATE_WITH_FIRST_UTM
 CURSOR_TAIL = "ON DUPLICATE KEY UPDATE " + ", ".join(f"{c} = VALUES({c})" for c in CURSOR_COLUMNS if c != "actor_id")
 CURSOR_CLAIM_TAIL = "ON DUPLICATE KEY UPDATE actor_id = actor_id"
 # Same placeholder row as CURSOR_CLAIM_SQL: only the actor id is a parameter.
@@ -278,9 +313,10 @@ _EVENT_TABLES = {"event": ("behavioral_events", _BEHAVIORAL_UPSERT_COLUMNS),
 class MySqlIntentStore:
     """One brand database inside one open transaction. The caller commits or rolls back."""
 
-    def __init__(self, cursor, utm: bool = True) -> None:
+    def __init__(self, cursor, utm: bool = True, first_utm: bool = True) -> None:
         self.cursor = cursor
         self.utm = utm            # False: this database has no utm_* columns yet; rows are written without them
+        self.first_utm = first_utm  # False: intent_sessions has no first_utm_source yet; session rows are written without it
         self._savepoints = 0
 
     def savepoint(self) -> str:
@@ -329,7 +365,10 @@ class MySqlIntentStore:
         return self.cursor.rowcount == 1
 
     def upsert_session(self, row: tuple) -> None:
-        self.cursor.execute(SESSION_UPSERT_SQL, row)
+        if self.first_utm:
+            self.cursor.execute(SESSION_UPSERT_SQL, row)
+        else:
+            self.cursor.execute(SESSION_UPSERT_SQL_NO_FIRST_UTM, row[:-1])
 
     # ---- bulk operations used by the fast path ----
 
@@ -390,9 +429,12 @@ class MySqlIntentStore:
             self.cursor.execute(bulk_insert_sql(ATC_TABLE, ("session_id", "product_id"), ATC_TAIL, len(chunk)), _flatten(chunk))
 
     def upsert_sessions(self, rows: Sequence[tuple]) -> None:
+        if not self.first_utm:
+            rows = [row[:-1] for row in rows]
+        columns = _SESSION_COLUMNS_WITH_FIRST_UTM if self.first_utm else _INTENT_SESSIONS_UPSERT_COLUMNS
+        tail = SESSION_TAIL if self.first_utm else SESSION_TAIL_NO_FIRST_UTM
         for chunk in bulk_chunks(rows):
-            self.cursor.execute(
-                bulk_insert_sql("intent_sessions", _INTENT_SESSIONS_UPSERT_COLUMNS, SESSION_TAIL, len(chunk)), _flatten(chunk))
+            self.cursor.execute(bulk_insert_sql("intent_sessions", columns, tail, len(chunk)), _flatten(chunk))
 
     def save_cursors(self, cursors: Sequence[ActorCursor]) -> None:
         rows = [(c.actor_id, c.session_id, c.session_start, c.last_event_at, c.last_event_id, json.dumps(c.events_seq))
