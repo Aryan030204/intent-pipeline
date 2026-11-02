@@ -63,6 +63,10 @@ SEQUENCE_MAX_LEN = 500
 SEQUENCE_MAX_STEPS = 15
 # Safety valve per day, and the chunk size the path rollup reads sessions in. Every session is stored now
 # (one-visit sessions included), so a busy brand has far more than the old 50,000 a day.
+# product_intent_daily always recomputes this many most recent days (today included): a session's level can
+# change after its day's events were rolled up (it closes, then it is scored), and scoring does not leave a
+# cheap marker to detect that. Older days are filled by scripts/backfill_product_intent.py.
+PRODUCT_INTENT_LOOKBACK_DAYS = max(1, int(os.environ.get("INTENT_PRODUCT_INTENT_LOOKBACK_DAYS", "3") or 3))
 ROLLUP_MAX_SESSIONS_PER_DATE = int(os.environ.get("ROLLUP_MAX_SESSIONS_PER_DATE", "300000") or 300000)
 ROLLUP_PATH_CHUNK = 20000
 
@@ -221,6 +225,36 @@ def _ensure_product_behavior_daily_table(cursor, connection) -> None:
     connection.commit()
 
 
+def _ensure_product_intent_daily_table(cursor, connection) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_intent_daily (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            summary_date DATE NOT NULL,
+            basis ENUM('behavior', 'score') NOT NULL,
+            intent_level ENUM('high', 'medium', 'low', 'unclassified') NOT NULL,
+            product_id VARCHAR(100) NOT NULL,
+            product_title VARCHAR(500) NULL,
+
+            product_views INT UNSIGNED NOT NULL DEFAULT 0,
+            unique_viewers INT UNSIGNED NOT NULL DEFAULT 0,
+            unique_sessions INT UNSIGNED NOT NULL DEFAULT 0,
+            add_to_cart_count INT UNSIGNED NOT NULL DEFAULT 0,
+            checkout_started_count INT UNSIGNED NOT NULL DEFAULT 0,
+
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                ON UPDATE CURRENT_TIMESTAMP(6),
+
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_date_basis_level_product (summary_date, basis, intent_level, product_id),
+            KEY idx_product_date (product_id, summary_date)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """
+    )
+    connection.commit()
+
+
 def _ensure_behavioral_path_daily_table(cursor, connection) -> None:
     cursor.execute(
         """
@@ -337,6 +371,7 @@ def _ensure_all_rollup_tables(cursor, connection) -> None:
     _ensure_page_behavior_daily_table(cursor, connection)
     _ensure_click_behavior_daily_table(cursor, connection)
     _ensure_product_behavior_daily_table(cursor, connection)
+    _ensure_product_intent_daily_table(cursor, connection)
     _ensure_behavioral_path_daily_table(cursor, connection)
     _ensure_path_first_event(cursor, connection)
     _ensure_heatmap_page_daily_table(cursor, connection)
@@ -478,7 +513,10 @@ def _change_signature(cursor) -> Optional[Tuple]:
         if not rows:
             return None
         row = rows[0]
-        return tuple(row[k] for k in ("events", "clicks", "sessions")) if isinstance(row, dict) else tuple(row)
+        ids = tuple(row[k] for k in ("events", "clicks", "sessions")) if isinstance(row, dict) else tuple(row)
+        # Scoring rewrites closed sessions in place, which no id shows; product_intent_daily depends on those
+        # levels. The hour bucket makes an otherwise idle brand run in full once an hour so they catch up.
+        return ids + (int(time.time() // 3600),)
     except Exception as exc:
         logger.debug("[rollup] change signature unavailable (%s); running in full", exc)
         return None
@@ -1333,6 +1371,167 @@ def _rollup_product_behavior_daily(cursor, connection, dates: List[date], source
 
 
 # ---------------------------
+# Rollup 4b: product_intent_daily
+# ---------------------------
+# The same counts as product_behavior_daily, split by the intent level of the session the event happened in,
+# once per basis. "behavior" is the dashboard's rule (BEHAVIOR_LEVEL_SQL in intentFunnelService.js: a product
+# view alone is not High); "score" is the percentile bucket the scoring engine wrote. A session that has no
+# row in intent_sessions yet (still open), is a bot, or is not scored (score basis) lands in 'unclassified',
+# so the levels of a product always add up to its product_behavior_daily row.
+_BEHAVIOR_LEVEL_EXPR = """CASE
+            WHEN s.session_id IS NULL OR s.intent_exclusion_reason = 'bot' THEN 'unclassified'
+            WHEN s.session_time_spent_ms < 5000 OR (s.click_count = 0 AND s.scroll_count = 0) THEN 'low'
+            WHEN s.click_count > 0 AND (s.add_to_cart_count > 0 OR s.checkout_started_count > 0) THEN 'high'
+            ELSE 'medium'
+        END"""
+_SCORE_LEVEL_EXPR = """CASE
+            WHEN s.intent_status = 'scored' AND s.intent_bucket IN ('low', 'medium', 'high') THEN s.intent_bucket
+            ELSE 'unclassified'
+        END"""
+_PRODUCT_INTENT_BASES = ("behavior", "score")
+
+
+def _product_intent_dates(dates: List[date], lookback_days: int = PRODUCT_INTENT_LOOKBACK_DAYS) -> List[date]:
+    """The window's days plus the most recent `lookback_days`, as one unbroken run of days."""
+    last = max(dates)
+    first = min(min(dates), last - timedelta(days=lookback_days - 1))
+    return [first + timedelta(days=i) for i in range((last - first).days + 1)]
+
+
+def _rollup_product_intent_daily(
+    cursor, connection, dates: List[date], source: Optional[_Source] = None, lookback_days: int = PRODUCT_INTENT_LOOKBACK_DAYS,
+) -> Dict[str, int]:
+    started_at = time.monotonic()
+    dates = _product_intent_dates(dates, lookback_days)
+    range_start, range_end = _window_bounds(dates)
+
+    cursor.execute(
+        _src(f"""
+        SELECT
+            DATE(e.occurred_at) AS d,
+            e.product_id,
+            ANY_VALUE(e.product_title) AS product_title,
+            {_BEHAVIOR_LEVEL_EXPR} AS behavior_level,
+            {_SCORE_LEVEL_EXPR} AS score_level,
+            SUM(e.event_name = 'product_viewed') AS product_views,
+            COUNT(DISTINCT CASE WHEN e.event_name = 'product_viewed' THEN e.actor_id END) AS unique_viewers,
+            COUNT(DISTINCT CASE WHEN e.event_name = 'product_viewed' THEN e.session_id END) AS unique_sessions,
+            SUM(e.event_name = 'product_added_to_cart') AS add_to_cart_count,
+            SUM(e.event_name = 'checkout_started') AS checkout_started_count
+        FROM behavioral_events e
+        LEFT JOIN intent_sessions s ON s.session_id = e.session_id
+        WHERE e.occurred_at >= %s AND e.occurred_at < %s
+              AND e.product_id IS NOT NULL AND e.product_id <> ''
+              AND LEFT(e.product_id, 1) <> '['
+        GROUP BY DATE(e.occurred_at), e.product_id, behavior_level, score_level
+        """, source),
+        (range_start, range_end),
+    )
+    agg_rows = cursor.fetchall()
+
+    cursor.execute(
+        _src(f"""
+        SELECT
+            DATE(e.occurred_at) AS d,
+            e.product_id,
+            ANY_VALUE(e.product_title) AS product_title,
+            {_BEHAVIOR_LEVEL_EXPR} AS behavior_level,
+            {_SCORE_LEVEL_EXPR} AS score_level,
+            COUNT(*) AS checkouts
+        FROM behavioral_events e
+        LEFT JOIN intent_sessions s ON s.session_id = e.session_id
+        WHERE e.occurred_at >= %s AND e.occurred_at < %s
+              AND e.event_name = 'checkout_started'
+              AND LEFT(e.product_id, 1) = '['
+        GROUP BY DATE(e.occurred_at), e.product_id, behavior_level, score_level
+        """, source),
+        (range_start, range_end),
+    )
+    cart_rows = cursor.fetchall()
+    scanned = (
+        sum(int(r["product_views"] or 0) for r in agg_rows)
+        + sum(r["checkouts"] for r in cart_rows)
+    )
+
+    merged: Dict[Tuple[date, str, str, str], Dict[str, Any]] = {}
+
+    def _bucket(target_date: date, basis: str, level: str, product_id: str) -> Dict[str, Any]:
+        key = (target_date, basis, level, product_id)
+        if key not in merged:
+            merged[key] = {"title": None, "views": 0, "viewers": 0, "sessions": 0, "atc": 0, "checkouts": 0}
+        return merged[key]
+
+    def _levels(row) -> Tuple[Tuple[str, str], Tuple[str, str]]:
+        return (("behavior", row["behavior_level"]), ("score", row["score_level"]))
+
+    for r in agg_rows:
+        pid = _normalize_product_id(r["product_id"])
+        if not pid:
+            continue
+        for basis, level in _levels(r):
+            b = _bucket(r["d"], basis, level, pid)
+            b["title"] = b["title"] or r["product_title"]
+            b["views"] += int(r["product_views"] or 0)
+            b["viewers"] += int(r["unique_viewers"] or 0)
+            b["sessions"] += int(r["unique_sessions"] or 0)
+            b["atc"] += int(r["add_to_cart_count"] or 0)
+            b["checkouts"] += int(r["checkout_started_count"] or 0)
+
+    unparsed_carts = 0
+    for r in cart_rows:
+        parsed = _parse_cart_products(r["product_id"], r["product_title"])
+        if not parsed:
+            unparsed_carts += r["checkouts"]
+            continue
+        for pid, title in parsed:
+            for basis, level in _levels(r):
+                b = _bucket(r["d"], basis, level, pid)
+                b["title"] = b["title"] or title
+                b["checkouts"] += r["checkouts"]
+    if unparsed_carts:
+        logger.warning(
+            "[rollup product_intent_daily] %s checkout_started event(s) had unparseable "
+            "cart product_id lists and were not attributed to products",
+            unparsed_carts,
+        )
+
+    rows: List[Tuple] = []
+    computed_keys_by_date: Dict[date, Set[Tuple]] = {d: set() for d in dates}
+    for (target_date, basis, level, pid), b in merged.items():
+        rows.append((
+            target_date, basis, level, pid, (b["title"] or None),
+            b["views"], b["viewers"], b["sessions"], b["atc"], b["checkouts"],
+        ))
+        computed_keys_by_date.setdefault(target_date, set()).add((basis, level, pid))
+
+    insert_sql = """
+        INSERT INTO product_intent_daily (
+            summary_date, basis, intent_level, product_id, product_title, product_views,
+            unique_viewers, unique_sessions, add_to_cart_count, checkout_started_count
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            product_title = VALUES(product_title),
+            product_views = VALUES(product_views),
+            unique_viewers = VALUES(unique_viewers),
+            unique_sessions = VALUES(unique_sessions),
+            add_to_cart_count = VALUES(add_to_cart_count),
+            checkout_started_count = VALUES(checkout_started_count)
+    """
+    upserted, deleted = _upsert_rollup_rows(
+        cursor, connection, "product_intent_daily", insert_sql, rows,
+        ["summary_date", "basis", "intent_level", "product_id"], dates, computed_keys_by_date,
+    )
+
+    duration = time.monotonic() - started_at
+    logger.info(
+        "[rollup product_intent_daily] range=%s..%s duration=%.2fs rows_scanned=%s "
+        "rows_generated=%s rows_upserted=%s rows_deleted_stale=%s",
+        range_start, range_end, duration, scanned, len(rows), upserted, deleted,
+    )
+    return {"scanned": scanned, "generated": len(rows), "upserted": upserted, "deleted": deleted}
+
+
+# ---------------------------
 # Rollup 5: behavioral_path_daily
 # ---------------------------
 def _rollup_behavioral_path_daily(cursor, connection, dates: List[date], source: Optional[_Source] = None) -> Dict[str, int]:
@@ -1560,6 +1759,7 @@ _ROLLUP_STAGES = (
     ("page_behavior_daily", _rollup_page_behavior_daily),
     ("click_behavior_daily", _rollup_click_behavior_daily),
     ("product_behavior_daily", _rollup_product_behavior_daily),
+    ("product_intent_daily", _rollup_product_intent_daily),
     ("behavioral_path_daily", _rollup_behavioral_path_daily),
     ("heatmap_page_daily", _rollup_heatmap_page_daily),
 )

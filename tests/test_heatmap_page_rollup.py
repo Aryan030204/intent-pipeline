@@ -50,7 +50,7 @@ def row(path, device, views, sessions, d=DAY):
 def test_it_is_one_of_the_rollup_stages_and_its_table_is_created_with_the_others(monkeypatch):
     assert "heatmap_page_daily" in [name for name, _ in rollups._ROLLUP_STAGES]
     for name in ("intent_daily_summary", "page_behavior_daily", "click_behavior_daily",
-                 "product_behavior_daily", "behavioral_path_daily"):
+                 "product_behavior_daily", "product_intent_daily", "behavioral_path_daily"):
         monkeypatch.setattr(rollups, f"_ensure_{name}_table", lambda cursor, connection: None)
     cursor, conn = Cursor([]), Conn()
     rollups._ensure_all_rollup_tables(cursor, conn)
