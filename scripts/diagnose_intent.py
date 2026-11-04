@@ -11,7 +11,8 @@ thresholds, 4 predictive vs operational buckets, 5 cohorts, 6 features by bucket
 12 Score + Sessions next to Clarity (deltas in percentage points), 13 Feature | Low | Medium | High | Overall,
 14 do readers who do not click end up Low, 15 product view duplication, 16 bounce penalty impact,
 17 hard override impact, 18 scoring backlog by day, 19 event-name census (do scroll events reach scroll_count?),
-20 dead-click rate distribution (why P90 is 1.0), 21 canonical session reconciliation (add --deep for the per-session check).
+20 dead-click rate distribution (why P90 is 1.0), 21 canonical session reconciliation (add --deep for the per-session check),
+22 click signal V2 (useful / dead clicks, response signals, legacy vs new contract; --deep adds the per-signal counts).
 Compare with another tool's numbers with --clarity 42.87,44.77,12.36 --clarity-sessions 12251, and run only some
 sections with --only 10,18,19. A day the scoring worker has already finished (say yesterday) gives the real Score view.
 
@@ -138,7 +139,7 @@ def dead_click_summary(rates: Sequence[float]) -> Dict[str, Any]:
     n = len(ordered)
     if not n:
         return {"count": 0}
-    pct = {f"P{p}": _percentile(ordered, p) for p in (50, 75, 90, 95, 99)}
+    pct = {f"P{p}": _percentile(ordered, p) for p in (50, 75, 80, 85, 90, 95, 99)}
     buckets = []
     for low, high, label in DEAD_RATE_BUCKETS:
         if low == high:
@@ -152,6 +153,28 @@ def dead_click_summary(rates: Sequence[float]) -> Dict[str, Any]:
         "above_p90": sum(1 for r in ordered if r > p90), "at_or_above_p90": sum(1 for r in ordered if r >= p90),
         "buckets": buckets,
     }
+
+
+def response_count_bucket(count: Optional[int]) -> str:
+    """How many response signals a click carried, as the four groups the click-signal section reports."""
+    n = int(count or 0)
+    return "3+" if n >= 3 else str(n)
+
+
+def struggle_trigger_report(rates: Sequence[float], stored_p90: Optional[float]) -> Dict[str, Any]:
+    """Can the struggle rule (dead-click rate strictly above the day's stored P90) fire for this population? The rule is
+    `rate > P90`, so a population is only penalised if some session sits above the stored threshold."""
+    if stored_p90 is None:
+        return {"stored_p90": None, "sessions": len(rates), "above_stored_p90": None, "can_fire": None}
+    above = sum(1 for r in rates if r > stored_p90)
+    return {"stored_p90": stored_p90, "sessions": len(rates), "above_stored_p90": above, "can_fire": above > 0}
+
+
+def contract_label(version: Optional[int]) -> str:
+    """The click rows' contract, from the marker /track writes: no marker = a row written before Click Signal V2."""
+    if version is None:
+        return "legacy (no marker)"
+    return "v2 (pixel sends response_signals)" if int(version) >= 2 else "v1 (new /track, pixel without response_signals)"
 
 
 def reconciliation_report(n: Dict[str, Optional[int]]) -> List[Dict[str, Any]]:
@@ -401,8 +424,8 @@ def clicks(q: Reader, start: datetime, end: datetime) -> None:
     show(q.rows("SELECT COUNT(*) AS clicks, SUM(click_bucket = 'useful_click') AS useful, SUM(click_bucket = 'dead_click') AS dead, "
                 "SUM(click_bucket IS NULL) AS unclassified, 100 * SUM(click_bucket = 'dead_click') / COUNT(*) AS dead_pct "
                 "FROM click_events WHERE occurred_at >= %s AND occurred_at < %s", (start, end)))
-    say("  useful = the browser reported url_changed OR cart_changed OR ui_changed OR meaningful_scroll after the click")
-    say("  (alerts-service/services/intent/normalize.js classifyClick); the signals are computed in the web pixel.")
+    say("  useful = url_changed OR cart_changed OR ui_changed OR meaningful_scroll OR at least one response signal, decided by")
+    say("  /track (alerts-service/services/intent/normalize.js classifyClickSignals) from what the pixel observed. See section 22.")
     show(q.rows("SELECT SUM(url_changed) AS url_changed, SUM(cart_changed) AS cart_changed, SUM(ui_changed) AS ui_changed, "
                 "SUM(meaningful_scroll) AS meaningful_scroll FROM click_events WHERE occurred_at >= %s AND occurred_at < %s", (start, end)))
 
@@ -466,22 +489,37 @@ def dead_click_distribution(q: Reader, start: datetime, end: datetime, day: date
     heading(20, "DEAD-CLICK RATE DISTRIBUTION (sessions with at least 10 clicks): why is P90 exactly 1.0?")
     say("  The struggle penalty needs click_count >= 10 AND dead_click_rate > the day's P90. The calibration takes P90 over")
     say("  intent_repository.fetch_dead_click_rates_for_date: ALL sessions of the day with >= 10 clicks, bots and unscored")
-    say("  ones included. (A rate can never exceed 1.0, so if P90 is 1.0 the rule cannot fire.)")
+    say("  ones included. (A rate can never exceed 1.0, so if P90 is 1.0 the rule cannot fire.) The dead clicks are the")
+    say("  /track classification (section 22): a click that got a response signal is useful, not dead.")
     thresholds = q.optional("SELECT score_date, p90_dead_click_rate FROM intent_thresholds_daily WHERE score_date BETWEEN %s AND %s ORDER BY score_date DESC",
                             (day - timedelta(days=4), day))
     say("  stored P90 dead-click rate:")
     show(thresholds)
-    for label, extra in (("all sessions with >= 10 clicks (what the calibration reads)", ""),
-                         ("excluding bots and zero-signal (what the scoring actually penalises)",
-                          "AND (intent_exclusion_reason IS NULL OR intent_exclusion_reason NOT IN ('bot', 'zero_signal'))")):
+    stored_p90 = next((float(r["p90_dead_click_rate"]) for r in thresholds
+                       if r.get("score_date") == day and r.get("p90_dead_click_rate") is not None), None)
+    populations = (
+        ("all sessions with >= 10 clicks (what the calibration reads)", ""),
+        ("excluding bots and zero-signal (what the scoring actually penalises)",
+         "AND (intent_exclusion_reason IS NULL OR intent_exclusion_reason NOT IN ('bot', 'zero_signal'))"),
+        ("bots only", "AND intent_exclusion_reason = 'bot'"),
+        ("unscored, not bots (pending or excluded)", "AND intent_status <> 'scored' AND (intent_exclusion_reason IS NULL OR intent_exclusion_reason <> 'bot')"),
+        ("scored sessions", "AND intent_status = 'scored'"),
+    )
+    for label, extra in populations:
         rows = q.rows(f"SELECT click_count, dead_click_count FROM intent_sessions WHERE session_start >= %s AND session_start < %s "
                       f"AND click_count >= 10 AND session_time_spent_ms IS NOT NULL {extra} LIMIT %s", (start, end, MAX_SCORES))
         rates = [min(1.0, (int(r["dead_click_count"] or 0) / int(r["click_count"]))) for r in rows if int(r["click_count"] or 0) > 0]
         summary = dead_click_summary(rates)
         say(f"  {label}: {summary.get('count', 0)} sessions")
         if summary.get("count"):
-            table([(k, summary[k]) for k in ("P50", "P75", "P90", "P95", "P99", "max", "above_p90", "at_or_above_p90")])
+            table([(k, summary[k]) for k in ("P50", "P75", "P80", "P85", "P90", "P95", "P99", "max", "above_p90", "at_or_above_p90")])
             show(summary["buckets"])
+            trigger = struggle_trigger_report(rates, stored_p90)
+            if trigger["can_fire"] is None:
+                say("  struggle rule against the stored P90 of the day: no stored P90 for this day (not calibrated yet)")
+            else:
+                say(f"  struggle rule `rate > stored P90 ({trigger['stored_p90']})`: {trigger['above_stored_p90']} of {trigger['sessions']} sessions "
+                    f"would be penalised -> the rule {'CAN' if trigger['can_fire'] else 'CANNOT'} fire on this population")
     say("  bots among the >= 10-click sessions:")
     show(q.rows("SELECT COALESCE(intent_exclusion_reason, '(not excluded)') AS reason, COUNT(*) AS sessions, "
                 "100 * AVG(dead_click_count = click_count) AS pct_all_dead FROM intent_sessions WHERE session_start >= %s "
@@ -512,6 +550,56 @@ def canonical_reconciliation(q: Reader, start: datetime, end: datetime, day: dat
                         "AND NOT EXISTS (SELECT 1 FROM behavioral_events e WHERE e.session_id = s.session_id AND e.occurred_at >= %s)", (start, end, start)))
     else:
         say("  (add --deep to also count sessions that have no behavioral_events row; it does one lookup per session)")
+
+
+SIGNAL_V2_CONTRACT = "CAST(JSON_UNQUOTE(JSON_EXTRACT(data, '$.signals.contract_version')) AS UNSIGNED)"
+RESPONSE_EVENTS = ("page_viewed", "product_viewed", "product_added_to_cart", "product_removed_from_cart", "cart_viewed",
+                   "collection_viewed", "search_submitted", "alert_displayed", "checkout_started", "checkout_contact_info_submitted",
+                   "checkout_address_info_submitted", "checkout_shipping_info_submitted", "payment_info_submitted",
+                   "checkout_completed", "input_focused", "input_changed", "form_submitted", "Started_Checkout_GK", "scroll_depth")
+RESPONSE_CATEGORIES = ("navigation", "product", "cart", "collection", "search", "checkout", "form", "alert", "scroll", "other")
+
+
+def click_signal_v2(q: Reader, start: datetime, end: datetime, deep: bool) -> None:
+    heading(22, "CLICK SIGNAL V2: useful vs dead clicks, response signals, legacy vs new contract")
+    say("  /track (normalize.js classifyClickSignals) calls a click useful when url_changed OR cart_changed OR ui_changed OR")
+    say("  meaningful_scroll OR it has at least one response signal; the pixel's own useful_click / dead_click are ignored.")
+    say("  A click with several response signals is still ONE click. Rows written before this change have no response signals.")
+    say("  A. total / useful / dead clicks (D, E = useful % and dead %):")
+    show(q.rows("SELECT COUNT(*) AS clicks, SUM(click_bucket = 'useful_click') AS useful, SUM(click_bucket = 'dead_click') AS dead, "
+                "SUM(click_bucket IS NULL) AS unclassified, 100 * SUM(click_bucket = 'useful_click') / COUNT(*) AS useful_pct, "
+                "100 * SUM(click_bucket = 'dead_click') / COUNT(*) AS dead_pct "
+                "FROM click_events WHERE occurred_at >= %s AND occurred_at < %s", (start, end)))
+    say("  I. legacy rows vs new-contract rows (the marker /track writes into click_events.data):")
+    split = q.optional(f"SELECT {SIGNAL_V2_CONTRACT} AS contract_version, COUNT(*) AS clicks, SUM(click_bucket = 'useful_click') AS useful, "
+                       f"SUM(click_bucket = 'dead_click') AS dead, 100 * SUM(click_bucket = 'dead_click') / COUNT(*) AS dead_pct "
+                       f"FROM click_events WHERE occurred_at >= %s AND occurred_at < %s GROUP BY 1 ORDER BY 1", (start, end))
+    for row in split:
+        row["contract"] = contract_label(row.pop("contract_version"))
+    show(split, ["contract", "clicks", "useful", "dead", "dead_pct"])
+    say("  H. how many response signals each new-contract (v2) click carried:")
+    counts = q.optional(f"SELECT LEAST(COALESCE(JSON_LENGTH(JSON_EXTRACT(data, '$.signals.response_signals')), 0), 3) AS response_count, "
+                        f"COUNT(*) AS clicks, SUM(click_bucket = 'dead_click') AS dead FROM click_events "
+                        f"WHERE occurred_at >= %s AND occurred_at < %s AND {SIGNAL_V2_CONTRACT} >= 2 GROUP BY 1 ORDER BY 1", (start, end))
+    for row in counts:
+        row["response_signals"] = response_count_bucket(row.pop("response_count"))
+    show(counts, ["response_signals", "clicks", "dead"])
+    if not deep:
+        say("  (add --deep for F and G: the count of every response signal and category; it reads each v2 click's JSON)")
+        return
+    say("  F. response signals by event name (v2 clicks; a click counts once per distinct signal):")
+    names = q.optional("SELECT jt.event_name AS event_name, COUNT(*) AS clicks FROM click_events c, "
+                       "JSON_TABLE(c.data, '$.signals.response_signals[*]' COLUMNS (event_name VARCHAR(64) PATH '$.event_name')) AS jt "
+                       "WHERE c.occurred_at >= %s AND c.occurred_at < %s GROUP BY 1 ORDER BY 2 DESC", (start, end))
+    by_name = {r["event_name"]: int(r["clicks"]) for r in names}
+    unknown = sum(count for name, count in by_name.items() if name not in RESPONSE_EVENTS)
+    show([{"event_name": name, "clicks": by_name.get(name, 0)} for name in RESPONSE_EVENTS] + [{"event_name": "unknown/other", "clicks": unknown}])
+    say("  G. response categories (v2 clicks; a click counts once per distinct category):")
+    cats = q.optional("SELECT jt.category AS category, COUNT(*) AS clicks FROM click_events c, "
+                      "JSON_TABLE(c.data, '$.signals.response_categories[*]' COLUMNS (category VARCHAR(16) PATH '$')) AS jt "
+                      "WHERE c.occurred_at >= %s AND c.occurred_at < %s GROUP BY 1 ORDER BY 2 DESC", (start, end))
+    by_category = {r["category"]: int(r["clicks"]) for r in cats}
+    show([{"category": name, "clicks": by_category.get(name, 0)} for name in RESPONSE_CATEGORIES])
 
 
 def duplicates(q: Reader, start: datetime, end: datetime) -> None:
@@ -647,7 +735,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="Clarity low,medium,high percentages to compare with (default %(default)s)")
     parser.add_argument("--clarity-sessions", type=int, default=None, help="Clarity's session count for the day (e.g. 12251)")
     parser.add_argument("--only", default=None, help="run only these section numbers, e.g. 10,18,19 (default: all)")
-    parser.add_argument("--deep", action="store_true", help="also run the lookups that cost one read per session (section 21)")
+    parser.add_argument("--deep", action="store_true", help="also run the lookups that cost one read per session (section 21) or per click (section 22)")
     args = parser.parse_args(argv)
     try:
         args.only_sections = {int(n) for n in args.only.split(",") if n.strip()} if args.only else None
@@ -699,6 +787,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             (19, lambda: event_census(q, start, end)),
             (20, lambda: dead_click_distribution(q, start, end, args.date)),
             (21, lambda: canonical_reconciliation(q, start, end, args.date, args.deep)),
+            (22, lambda: click_signal_v2(q, start, end, args.deep)),
         ]
         for number, run in steps:
             if args.only_sections is None or number in args.only_sections:

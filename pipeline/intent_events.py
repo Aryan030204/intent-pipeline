@@ -83,6 +83,9 @@ _CLICK_FIELDS = (
     "href",
 )
 _SIGNAL_FIELDS = ("url_changed", "cart_changed", "ui_changed", "meaningful_scroll")
+# Click Signal V2: what /track derived from the pixel's response signals. They live in the click row's `data` JSON
+# (no new column); a message that does not carry them (older /track) stores exactly what it always stored.
+_SIGNAL_V2_FIELDS = ("useful_click", "dead_click", "response_signals", "response_categories", "contract_version")
 
 # Table's fixed, nullable columns pulled from the nested `raw` payload - not
 # dynamic/on-the-fly like a per-event-type dynamic columns table.
@@ -269,9 +272,17 @@ def _extract_click_event_row(doc: Dict[str, Any]) -> Optional[Tuple]:
     if click_bucket not in _VALID_CLICK_BUCKETS:
         click_bucket = None
 
+    signals_payload = {field: signals.get(field) for field in _SIGNAL_FIELDS}
+    for field in _SIGNAL_V2_FIELDS:
+        if field not in signals:
+            continue
+        value = signals[field]
+        if field in ("response_signals", "response_categories") and not isinstance(value, list):
+            continue
+        signals_payload[field] = value
     data_payload = {
         "click": {field: click.get(field) for field in _CLICK_FIELDS},
-        "signals": {field: signals.get(field) for field in _SIGNAL_FIELDS},
+        "signals": signals_payload,
     }
 
     return (

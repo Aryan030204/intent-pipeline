@@ -12,7 +12,8 @@ per-brand aggregate tables for dashboard consumption:
     behavioral_path_daily  - grain: date + sequence_hash
 
 and a sixth, heatmap_page_daily (grain: date + page_path + device), behind the dashboard's Heatmaps
-"popular pages" list.
+"popular pages" list. Besides page views and sessions it holds, per page, the sessions at each Behaviour
+intent level (high / medium / low): the three coloured parts of the pill on each row.
 
 This module does NOT touch Mongo and does NOT modify raw ingestion. It is
 purely a read-from-MySQL / upsert-to-MySQL stage, invoked after ingestion
@@ -347,6 +348,9 @@ def _first_event_of(sequence: str) -> str:
     return str(sequence or "").split(">", 1)[0][:PATH_FIRST_EVENT_MAX_LEN]
 
 
+_HEATMAP_INTENT_COLUMNS = ("high_sessions", "medium_sessions", "low_sessions")
+
+
 def _ensure_heatmap_page_daily_table(cursor, connection) -> None:
     # Same definition as analytics/scripts/heatmap-pages-rollup.cjs (which stays for back-filling old days).
     cursor.execute(
@@ -357,6 +361,9 @@ def _ensure_heatmap_page_daily_table(cursor, connection) -> None:
             device_type VARCHAR(10) NOT NULL,
             page_views INT UNSIGNED NOT NULL DEFAULT 0,
             sessions INT UNSIGNED NOT NULL DEFAULT 0,
+            high_sessions INT UNSIGNED NOT NULL DEFAULT 0,
+            medium_sessions INT UNSIGNED NOT NULL DEFAULT 0,
+            low_sessions INT UNSIGNED NOT NULL DEFAULT 0,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             PRIMARY KEY (summary_date, page_path, device_type),
             KEY idx_page_date (page_path, summary_date)
@@ -364,6 +371,9 @@ def _ensure_heatmap_page_daily_table(cursor, connection) -> None:
         """
     )
     connection.commit()
+    # The intent counts were added after the table first shipped (the dashboard's back-fill script adds them too).
+    for column in _HEATMAP_INTENT_COLUMNS:
+        _ensure_column_exists(cursor, connection, "heatmap_page_daily", column, "INT UNSIGNED NOT NULL DEFAULT 0")
 
 
 def _ensure_all_rollup_tables(cursor, connection) -> None:
@@ -1687,57 +1697,136 @@ def _heatmap_rollup_enabled() -> bool:
     return os.environ.get("INTENT_HEATMAP_ROLLUP", "on").strip().lower() not in ("off", "false", "0", "no")
 
 
+# The Behaviour-level counts of each page. INTENT_HEATMAP_INTENT=off keeps the stage to page views and sessions
+# (the intent columns are then left as they are). A session's level is only known once it is closed, and it can
+# change after its day was rolled up (it closes after midnight), so the most recent days are recomputed too.
+HEATMAP_INTENT_LOOKBACK_DAYS = max(1, int(os.environ.get("INTENT_HEATMAP_INTENT_LOOKBACK_DAYS", "2") or 2))
+_HEATMAP_DEVICE_CASE_SQL_E = _HEATMAP_DEVICE_CASE_SQL.replace("user_agent", "e.user_agent")
+
+
+def _heatmap_intent_enabled() -> bool:
+    return os.environ.get("INTENT_HEATMAP_INTENT", "on").strip().lower() not in ("off", "false", "0", "no")
+
+
+def _fetch_heatmap_pages(cursor, range_start, range_end, with_intent: bool):
+    """Page views and sessions per day, raw path and device; with `with_intent` also the sessions at each level
+    (closed sessions only: a bot, or a session without a row in intent_sessions yet, is in none of the three)."""
+    if with_intent:
+        cursor.execute(
+            f"""
+            SELECT
+                DATE(e.occurred_at) AS d,
+                SUBSTRING_INDEX(SUBSTRING_INDEX(e.url, '?', 1), '#', 1) AS raw_path,
+                {_HEATMAP_DEVICE_CASE_SQL_E} AS device_type,
+                COUNT(*) AS page_views,
+                COUNT(DISTINCT e.session_id) AS sessions,
+                COUNT(DISTINCT CASE WHEN {_BEHAVIOR_LEVEL_EXPR} = 'high' THEN e.session_id END) AS high_sessions,
+                COUNT(DISTINCT CASE WHEN {_BEHAVIOR_LEVEL_EXPR} = 'medium' THEN e.session_id END) AS medium_sessions,
+                COUNT(DISTINCT CASE WHEN {_BEHAVIOR_LEVEL_EXPR} = 'low' THEN e.session_id END) AS low_sessions
+            FROM behavioral_events e
+            LEFT JOIN intent_sessions s ON s.session_id = e.session_id
+            WHERE e.event_name = 'page_viewed'
+              AND e.occurred_at >= %s AND e.occurred_at < %s
+              AND e.url IS NOT NULL AND e.url <> ''
+            GROUP BY DATE(e.occurred_at), raw_path, device_type
+            """,
+            (range_start, range_end),
+        )
+    else:
+        cursor.execute(
+            f"""
+            SELECT
+                DATE(occurred_at) AS d,
+                SUBSTRING_INDEX(SUBSTRING_INDEX(url, '?', 1), '#', 1) AS raw_path,
+                {_HEATMAP_DEVICE_CASE_SQL} AS device_type,
+                COUNT(*) AS page_views,
+                COUNT(DISTINCT session_id) AS sessions
+            FROM behavioral_events
+            WHERE event_name = 'page_viewed'
+              AND occurred_at >= %s AND occurred_at < %s
+              AND url IS NOT NULL AND url <> ''
+            GROUP BY DATE(occurred_at), raw_path, device_type
+            """,
+            (range_start, range_end),
+        )
+    return cursor.fetchall()
+
+
 def _rollup_heatmap_page_daily(cursor, connection, dates: List[date], source: Optional[_Source] = None) -> Dict[str, int]:
     if not _heatmap_rollup_enabled():
         return {"scanned": 0, "generated": 0, "upserted": 0, "deleted": 0}
     started_at = time.monotonic()
+    with_intent = _heatmap_intent_enabled()
+    if with_intent:
+        dates = _product_intent_dates(dates, HEATMAP_INTENT_LOOKBACK_DAYS)
     range_start, range_end = _window_bounds(dates)
 
-    cursor.execute(
-        f"""
-        SELECT
-            DATE(occurred_at) AS d,
-            SUBSTRING_INDEX(SUBSTRING_INDEX(url, '?', 1), '#', 1) AS raw_path,
-            {_HEATMAP_DEVICE_CASE_SQL} AS device_type,
-            COUNT(*) AS page_views,
-            COUNT(DISTINCT session_id) AS sessions
-        FROM behavioral_events
-        WHERE event_name = 'page_viewed'
-          AND occurred_at >= %s AND occurred_at < %s
-          AND url IS NOT NULL AND url <> ''
-        GROUP BY DATE(occurred_at), raw_path, device_type
-        """,
-        (range_start, range_end),
-    )
-    fetched = cursor.fetchall()
+    fetched = None
+    if with_intent:
+        try:
+            fetched = _fetch_heatmap_pages(cursor, range_start, range_end, with_intent=True)
+        except Exception as exc:
+            # The levels are an extra: if the joined read fails or times out, the page counts are still refreshed and
+            # the stored intent counts are left alone (never zeroed).
+            logger.warning("[rollup heatmap_page_daily] intent counts skipped, the joined read failed (%s: %s); "
+                           "refreshing page views and sessions only", type(exc).__name__, str(exc)[:160])
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+            with_intent = False
+    if fetched is None:
+        fetched = _fetch_heatmap_pages(cursor, range_start, range_end, with_intent=False)
     scanned = sum(int(r["page_views"] or 0) for r in fetched)
 
-    # Different raw paths can normalise to the same page ("/a" and "/a/"): their counts add up. Sessions are
-    # summed the same way page_behavior_daily sums its unique sessions.
+    # Different raw paths can normalise to the same page ("/a" and "/a/"): their counts add up. Sessions (and the
+    # sessions at each level) are summed the same way page_behavior_daily sums its unique sessions.
     merged: Dict[Tuple[date, str, str], List[int]] = {}
     for r in fetched:
         path = _normalize_page_path(r["raw_path"])
         if path == "(unknown)":
             continue
-        counts = merged.setdefault((r["d"], path, r["device_type"]), [0, 0])
+        counts = merged.setdefault((r["d"], path, r["device_type"]), [0, 0, 0, 0, 0])
         counts[0] += int(r["page_views"] or 0)
         counts[1] += int(r["sessions"] or 0)
+        if with_intent:
+            counts[2] += int(r.get("high_sessions") or 0)
+            counts[3] += int(r.get("medium_sessions") or 0)
+            counts[4] += int(r.get("low_sessions") or 0)
 
     rows: List[Tuple] = []
     computed_keys_by_date: Dict[date, Set[Tuple]] = {d: set() for d in dates}
-    for (target_date, path, device), (views, sessions) in merged.items():
+    classified = 0
+    for (target_date, path, device), (views, sessions, high, medium, low) in merged.items():
         if target_date not in computed_keys_by_date:
             continue
-        rows.append((target_date, path, device, views, sessions))
+        if with_intent:
+            rows.append((target_date, path, device, views, sessions, high, medium, low))
+            classified += high + medium + low
+        else:
+            rows.append((target_date, path, device, views, sessions))
         computed_keys_by_date[target_date].add((path, device))
 
-    insert_sql = """
-        INSERT INTO heatmap_page_daily (summary_date, page_path, device_type, page_views, sessions)
-        VALUES (%s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            page_views = VALUES(page_views),
-            sessions = VALUES(sessions)
-    """
+    if with_intent:
+        insert_sql = """
+            INSERT INTO heatmap_page_daily (summary_date, page_path, device_type, page_views, sessions,
+                high_sessions, medium_sessions, low_sessions)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                page_views = VALUES(page_views),
+                sessions = VALUES(sessions),
+                high_sessions = VALUES(high_sessions),
+                medium_sessions = VALUES(medium_sessions),
+                low_sessions = VALUES(low_sessions)
+        """
+    else:
+        insert_sql = """
+            INSERT INTO heatmap_page_daily (summary_date, page_path, device_type, page_views, sessions)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                page_views = VALUES(page_views),
+                sessions = VALUES(sessions)
+        """
     upserted, deleted = _upsert_rollup_rows(
         cursor, connection, "heatmap_page_daily", insert_sql, rows,
         ["summary_date", "page_path", "device_type"], dates, computed_keys_by_date,
@@ -1745,8 +1834,9 @@ def _rollup_heatmap_page_daily(cursor, connection, dates: List[date], source: Op
 
     logger.info(
         "[rollup heatmap_page_daily] range=%s..%s duration=%.2fs rows_scanned=%s rows_generated=%s "
-        "rows_upserted=%s rows_deleted_stale=%s",
+        "rows_upserted=%s rows_deleted_stale=%s intent=%s classified_sessions=%s",
         range_start, range_end, time.monotonic() - started_at, scanned, len(rows), upserted, deleted,
+        "on" if with_intent else "off", classified,
     )
     return {"scanned": scanned, "generated": len(rows), "upserted": upserted, "deleted": deleted}
 
