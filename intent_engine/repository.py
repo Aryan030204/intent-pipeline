@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from pipeline.state import IST
 from pipeline.intent_events import _ensure_column_exists
 from pipeline.db import executemany_chunked
+from intent_engine.config import EVIDENCE_MIN_DURATION_MS, EVIDENCE_STRONG_DURATION_MS
 
 _log = logging.getLogger("intent_pipeline")
 
@@ -559,6 +560,23 @@ def fetch_scored_predictive_scores_for_date(cursor, target_date: date, max_rows:
     return [float(r["predictive_score"]) for r in cursor.fetchall() if r["predictive_score"] is not None]
 
 
+def fetch_calibration_population_for_date(cursor, target_date: date, max_rows: int) -> List[Dict[str, Any]]:
+    """The scored sessions of a day with what the evidence stage needs: the calibration population is the positive
+    scores of stage >= 1 sessions only (see threshold_calibration)."""
+    start, end = _day_bounds(target_date)
+    cursor.execute(
+        """
+        SELECT predictive_score, product_view_count, page_view_count, useful_click_count, scroll_count,
+               session_time_spent_ms
+        FROM intent_sessions
+        WHERE session_start >= %s AND session_start < %s AND intent_status = 'scored'
+        LIMIT %s
+        """,
+        (start, end, max_rows),
+    )
+    return [r for r in cursor.fetchall() if r["predictive_score"] is not None]
+
+
 def upsert_daily_thresholds(
     cursor, connection, target_date: date, scored_session_count: int,
     p35: float, p72: float, p90_dead_click_rate: Optional[float],
@@ -584,23 +602,37 @@ def upsert_daily_thresholds(
     connection.commit()
 
 
+def _evidence_sql() -> Tuple[str, str]:
+    """(stage >= 1, stage 2) as SQL conditions on intent_sessions columns; the same rule as
+    score_calculator.evidence_stage. The values are module constants (ints), never user input."""
+    some = (f"(COALESCE(product_view_count, 0) >= 2 OR COALESCE(page_view_count, 0) >= 2 "
+            f"OR COALESCE(useful_click_count, 0) >= 1 OR COALESCE(scroll_count, 0) >= 1 "
+            f"OR COALESCE(session_time_spent_ms, 0) >= {int(EVIDENCE_MIN_DURATION_MS)})")
+    strong = (f"((COALESCE(product_view_count, 0) >= 2 AND COALESCE(page_view_count, 0) >= 2) "
+              f"OR COALESCE(useful_click_count, 0) >= 2 OR COALESCE(scroll_count, 0) >= 2 "
+              f"OR COALESCE(session_time_spent_ms, 0) >= {int(EVIDENCE_STRONG_DURATION_MS)})")
+    return some, strong
+
+
 def bulk_reassign_buckets_for_date(
     cursor, connection, target_date: date, p35: float, p72: float,
 ) -> int:
+    """Stage 0 -> low; stage 1 -> low / medium; stage 2 -> low / medium / high (score_calculator.assign_bucket_with_evidence).
+    The operational bucket keeps its commercial overrides (checkout entry, checkout started, add-to-cart -> high)."""
     start, end = _day_bounds(target_date)
+    some, strong = _evidence_sql()
+    bucket = f"""CASE
+                WHEN predictive_score <= 0 OR NOT {some} OR predictive_score < %s THEN 'low'
+                WHEN predictive_score < %s OR NOT {strong} THEN 'medium'
+                ELSE 'high' END"""
     cursor.execute(
-        """
+        f"""
         UPDATE intent_sessions
-        SET intent_bucket = CASE
-                WHEN predictive_score <= 0 OR predictive_score < %s THEN 'low'
-                WHEN predictive_score < %s THEN 'medium'
-                ELSE 'high' END,
+        SET intent_bucket = {bucket},
             operational_bucket = CASE
                 WHEN entry_page_type = 'checkout' OR checkout_started_count > 0
                      OR add_to_cart_count > 0 THEN 'high'
-                WHEN predictive_score <= 0 OR predictive_score < %s THEN 'low'
-                WHEN predictive_score < %s THEN 'medium'
-                ELSE 'high' END,
+                ELSE {bucket} END,
             updated_at = updated_at
         WHERE intent_status = 'scored' AND session_start >= %s AND session_start < %s
         """,

@@ -20,7 +20,7 @@ from intent_engine.traffic_quality import is_bot, is_zero_signal
 from intent_engine.feature_calculator import extract_features
 from intent_engine.penalties import struggle_penalty, bounce_penalty
 from intent_engine.page_modifier import highest_intent_page_type, modifier_for
-from intent_engine.score_calculator import compute_predictive_score, assign_bucket
+from intent_engine.score_calculator import compute_predictive_score, assign_bucket_with_evidence, evidence_stage_for_row
 from intent_engine.overrides import apply_hard_overrides
 from intent_engine.threshold_resolution import get_effective_thresholds
 from intent_engine.repository import (
@@ -234,7 +234,8 @@ def score_sessions(
         modifier = modifier_for(page_type_for_modifier)
 
         predictive_score = compute_predictive_score(features, struggle, bounce, modifier)
-        predictive_bucket = assign_bucket(predictive_score, thresholds.p35, thresholds.p72)
+        predictive_bucket = assign_bucket_with_evidence(
+            predictive_score, thresholds.p35, thresholds.p72, evidence_stage_for_row(session))
         operational_bucket = apply_hard_overrides(
             predictive_bucket, enr.entry_page_type,
             session.get("checkout_started_count") or 0,

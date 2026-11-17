@@ -181,7 +181,9 @@ def test_scoring_without_a_read_cursor_uses_the_primary_for_everything(monkeypat
 def test_calibration_bulk_reads_use_the_replica_and_the_writes_and_lookup_the_primary(monkeypatch):
     calls = []
     monkeypatch.setattr(threshold_calibration, "compute_dead_click_p90", lambda c, d: (calls.append(("p90", c)), 0.5)[1])
-    monkeypatch.setattr(threshold_calibration, "fetch_scored_predictive_scores_for_date", lambda c, d, m: (calls.append(("scores", c)), [10.0, 20.0])[1])
+    monkeypatch.setattr(threshold_calibration, "fetch_calibration_population_for_date", lambda c, d, m: (calls.append(("scores", c)), [
+        {"predictive_score": 10.0, "product_view_count": 2, "page_view_count": 3, "useful_click_count": 1, "scroll_count": 0,
+         "session_time_spent_ms": 60000}])[1])
     monkeypatch.setattr(threshold_calibration, "upsert_daily_thresholds", lambda c, *a: calls.append(("write_thresholds", c)))
     monkeypatch.setattr(threshold_calibration, "bulk_reassign_buckets_for_date", lambda c, *a: (calls.append(("write_reassign", c)), 0)[1])
     monkeypatch.setattr(threshold_calibration, "fetch_actor_ids_scored_on_date", lambda c, d: (calls.append(("actors_after_writes", c)), [])[1])

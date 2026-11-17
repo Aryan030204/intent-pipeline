@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from pipeline.intent_time_policy import normalize_occurred_at
+
 SCHEMA_VERSION = 1
 TYPE_EVENT = "event"
 TYPE_CLICK = "click"
@@ -63,6 +65,11 @@ class IntentMessage:
     click: Optional[Dict[str, Any]]
     signals: Optional[Dict[str, Any]]
     click_bucket: Optional[str]
+    # Set only for a message from a /track that stamps the receipt time. occurred_at is then already the time to
+    # sessionize with (a future client clock is replaced by the receipt time); client_occurred_at keeps what the client
+    # said, for diagnostics. Neither is stored in MySQL.
+    received_at: Optional[datetime] = None
+    client_occurred_at: Optional[datetime] = None
 
     @property
     def identity(self) -> Optional[str]:
@@ -139,6 +146,16 @@ def _parse_occurred_at(value: Any) -> datetime:
         raise InvalidMessage("occurred_at is not a valid ISO timestamp") from exc
 
 
+def _optional_time(value: Any) -> Optional[datetime]:
+    """An optional store-local time ending in Z; anything else is ignored (a diagnostic field must never poison a record)."""
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return None
+    try:
+        return datetime.fromisoformat(value[:-1]).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
 def _object(payload: Dict[str, Any], field: str) -> Optional[Dict[str, Any]]:
     value = payload.get(field)
     if value is None:
@@ -170,6 +187,11 @@ def parse_record(value: Any) -> IntentMessage:
     if (msg_type == TYPE_CLICK) != (event_name == "click"):
         raise InvalidMessage("type click and event_name click must go together")
 
+    received_at = _optional_time(payload.get("received_at"))
+    claimed_at = _parse_occurred_at(payload.get("occurred_at"))
+    occurred_at, replaced = normalize_occurred_at(claimed_at, received_at)
+    client_occurred_at = _optional_time(payload.get("client_occurred_at")) or (claimed_at if replaced else None)
+
     message = IntentMessage(
         type=msg_type,
         brand_id=brand_id,
@@ -178,7 +200,7 @@ def parse_record(value: Any) -> IntentMessage:
         actor_id=_text(payload, "actor_id"),
         client_id=_text(payload, "client_id"),
         visitor_id=_text(payload, "visitor_id"),
-        occurred_at=_parse_occurred_at(payload.get("occurred_at")),
+        occurred_at=occurred_at,
         url=_text(payload, "url", id_field=False),
         referrer=_text(payload, "referrer", id_field=False),
         user_agent=_text(payload, "user_agent", id_field=False),
@@ -186,6 +208,8 @@ def parse_record(value: Any) -> IntentMessage:
         click=_object(payload, "click"),
         signals=_object(payload, "signals"),
         click_bucket=payload.get("click_bucket"),
+        received_at=received_at,
+        client_occurred_at=client_occurred_at,
     )
 
     if msg_type == TYPE_CLICK:

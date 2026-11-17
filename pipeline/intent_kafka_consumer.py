@@ -55,6 +55,7 @@ from pipeline.intent_kafka_bulk import apply_batch_fast
 from pipeline.intent_kafka_writer import BrandResult, WorkItem, apply_batch
 from pipeline.intent_session_state import DEFAULT_SESSION_TIMEOUT_S
 from pipeline.intent_session_sweep import sweep_brand
+from pipeline.intent_time_policy import FUTURE_TOLERANCE_S, store_local_now
 from pipeline.state import logger
 
 DEFAULT_GROUP_ID = "intent-pipeline-workers"   # only the name offsets are committed under
@@ -273,16 +274,23 @@ class IntentIngestor:
                 return
             try:
                 result = sweep_brand(self.db, brand_index, self.cfg.session_timeout_s,
-                                     max_total=self.cfg.sweep_max_per_run, should_stop=self.stop_event.is_set)
+                                     max_total=self.cfg.sweep_max_per_run, should_stop=self.stop_event.is_set,
+                                     now_fn=lambda brand_index=brand_index: store_local_now(brand_index))
             except Exception as exc:
                 self.stats["sweep_failures"] += 1
                 logger.warning(f"[intent-kafka] category=sweep_failed brand_index={brand_index} "
                                f"{type(exc).__name__}: {str(exc)[:300]}")
                 continue
             self.stats["sessions_swept"] += result.closed
+            ahead_s = (result.latest - result.effective_latest).total_seconds() if result.latest and result.effective_latest else 0
+            if ahead_s > FUTURE_TOLERANCE_S:     # a cursor a few minutes ahead is normal clock skew; beyond the tolerance it is a poisoning attempt
+                self.stats["sweep_clock_capped"] += 1
+                logger.warning(f"[intent-kafka] category=sweep_clock_capped brand_index={brand_index} latest_cursor={result.latest} "
+                               f"store_now={result.effective_latest} ahead_s={ahead_s:.0f}: a cursor is dated in the future")
             if result.closed or result.skipped:
                 logger.info(f"[intent-kafka] category=sessions_swept brand_index={brand_index} closed={result.closed} "
-                            f"skipped={result.skipped} idle_before={result.cutoff}")
+                            f"skipped={result.skipped} idle_before={result.cutoff} latest={result.latest} "
+                            f"effective_latest={result.effective_latest}")
 
     def _drain(self, kafka, ranges) -> Tuple[str, str]:
         kafka.assign([self._tp(t, p, start) for (t, p), (start, _end) in sorted(ranges.items())])
@@ -410,6 +418,8 @@ class IntentIngestor:
             except InvalidMessage as exc:
                 dlq_entries.append((msg, f"invalid_message: {exc}", 0))
                 continue
+            if message.client_occurred_at is not None and message.client_occurred_at != message.occurred_at:
+                self.stats["future_timestamp_normalized"] += 1     # a future client clock replaced by the receipt time
             if expected_topic(message.event_name) != msg.topic():
                 logger.warning(
                     f"[intent-kafka] category=topic_mismatch event_id={message.event_id} "

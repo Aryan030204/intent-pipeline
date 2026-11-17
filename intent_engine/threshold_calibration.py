@@ -17,9 +17,10 @@ from intent_engine.config import (
     MIN_SESSIONS_FOR_PERCENTILE_CALIBRATION,
     CALIBRATION_MAX_SESSIONS_PER_DATE,
 )
+from intent_engine.score_calculator import evidence_stage_for_row
 from intent_engine.repository import (
     fetch_dead_click_rates_for_date,
-    fetch_scored_predictive_scores_for_date,
+    fetch_calibration_population_for_date,
     upsert_daily_thresholds,
     bulk_reassign_buckets_for_date,
     fetch_actor_ids_scored_on_date,
@@ -68,18 +69,19 @@ def calibrate_date_for_brand(
 
     p90 = compute_dead_click_p90(reader, target_date)
 
-    scores = fetch_scored_predictive_scores_for_date(
-        reader, target_date, CALIBRATION_MAX_SESSIONS_PER_DATE
-    )
-    scored_session_count = len(scores)
+    population = fetch_calibration_population_for_date(reader, target_date, CALIBRATION_MAX_SESSIONS_PER_DATE)
+    scored_session_count = len(population)
 
-    # Sessions that scored 0 (bounces and other one-page visits) are always "low" (see assign_bucket), so they
-    # are left out of the percentiles. Counting them would drag P35 down to 0 and shrink every other cut-off
-    # whenever bounces are a large share of the day, which they now are that every session is scored.
-    engaged_scores = [s for s in scores if s > 0]
+    # The percentile population is the POSITIVE scores of sessions with behavioural evidence (stage >= 1). Two kinds of
+    # session are left out. A score of 0 is always "low" (see assign_bucket): counting zeros would drag P35 to 0.
+    # A stage 0 session (a passive landing: at most one product view and one page view, no useful click or scroll,
+    # under 10 s) is always "low" too, yet it carries a small positive score; there are so many of them that, counted,
+    # they pull P35 / P72 far below the scores of genuinely engaged sessions and promote weak sessions to medium / high.
+    eligible_scores = [float(r["predictive_score"]) for r in population
+                       if float(r["predictive_score"]) > 0 and evidence_stage_for_row(r) >= 1]
 
-    if len(engaged_scores) >= MIN_SESSIONS_FOR_PERCENTILE_CALIBRATION:
-        sorted_scores = sorted(engaged_scores)
+    if len(eligible_scores) >= MIN_SESSIONS_FOR_PERCENTILE_CALIBRATION:
+        sorted_scores = sorted(eligible_scores)
         p35 = _percentile(sorted_scores, 35)
         p72 = _percentile(sorted_scores, 72)
         calibration_method = "percentile"
@@ -98,10 +100,10 @@ def calibrate_date_for_brand(
 
     duration = time.monotonic() - started_at
     logger.info(
-        "[intent calibration] date=%s duration=%.2fs scored_sessions=%s method=%s "
+        "[intent calibration] date=%s duration=%.2fs scored_sessions=%s eligible_positive=%s method=%s "
         "p35=%.2f p72=%.2f p90_dead_click_rate=%s sessions_reassigned=%s "
         "actors_affected=%s score_version=%s",
-        target_date, duration, scored_session_count, calibration_method,
+        target_date, duration, scored_session_count, len(eligible_scores), calibration_method,
         p35, p72, f"{p90:.4f}" if p90 is not None else "n/a",
         reassigned, len(affected_actor_ids), SCORE_VERSION,
     )
