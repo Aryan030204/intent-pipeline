@@ -45,6 +45,14 @@ FALLBACK_P72_THRESHOLD = 55.0
 MIN_SESSIONS_FOR_PERCENTILE_CALIBRATION = 500
 
 # ---------------------------
+# Evidence stages (bucketing eligibility; see score_calculator.evidence_stage)
+# ---------------------------
+# Stage 0 (a passive landing) is always low and stays OUT of the percentile population; stage 1 may be low or
+# medium, never high; stage 2 may be any bucket. These are behaviour-only: add-to-cart / checkout never enter.
+EVIDENCE_MIN_DURATION_MS = 10_000      # at or above: at least stage 1
+EVIDENCE_STRONG_DURATION_MS = 30_000   # at or above: stage 2
+
+# ---------------------------
 # Bot / crawler detection
 # ---------------------------
 # Starter list of well-known crawlers and automation tools, plus a generic

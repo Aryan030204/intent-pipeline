@@ -18,15 +18,19 @@ nothing still to come for an actor can be older than the newest ingested event m
 
 The sweep runs inside the worker's run lock, so the worker is the only writer of intent_actor_cursors.
 Scoring needs no change: a one-event, zero-duration session is already excluded there as "zero_signal".
+
+The reference is capped at the brand's store-local "now" (pipeline/intent_time_policy.effective_latest). Without the cap a
+single future-dated cursor made the sweep close live sessions every cycle.
 """
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 from pipeline.intent_kafka_contract import InvalidMessage
 from pipeline.intent_kafka_writer import _closed_session_row
 from pipeline.intent_session_state import closed_session_doc
+from pipeline.intent_time_policy import effective_latest
 from pipeline.state import logger
 
 SWEEP_MARGIN_S = 60        # slack on top of the session timeout, for clock skew and out-of-order arrival
@@ -39,6 +43,8 @@ class SweepResult:
     closed: int = 0
     skipped: int = 0
     cutoff: Optional[datetime] = None
+    latest: Optional[datetime] = None            # the newest cursor time the store reported
+    effective_latest: Optional[datetime] = None  # what the cutoff was really computed from (capped at store-local now)
 
 
 def sweep_cutoff(latest: Optional[datetime], timeout_s: int, margin_s: int = SWEEP_MARGIN_S) -> Optional[datetime]:
@@ -70,12 +76,16 @@ def sweep_chunk(store, cutoff: datetime, limit: int = SWEEP_CHUNK) -> SweepResul
 
 def sweep_brand(db, brand_index: int, timeout_s: int, margin_s: int = SWEEP_MARGIN_S,
                 chunk: int = SWEEP_CHUNK, max_total: int = SWEEP_MAX_PER_RUN,
-                should_stop=lambda: False) -> SweepResult:
+                should_stop=lambda: False, now_fn: Optional[Callable[[], datetime]] = None) -> SweepResult:
     """Closes this brand's idle sessions, one transaction per chunk, until none are left, the per-run limit
     is reached, a chunk makes no progress, or should_stop() says so."""
     with db.transaction(brand_index) as store:
-        cutoff = sweep_cutoff(store.latest_cursor_time(), timeout_s, margin_s)
-    total = SweepResult(cutoff=cutoff)
+        latest = store.latest_cursor_time()
+    # "Idle" is judged against the newest ingested event, but never against a time that has not happened yet: a cursor
+    # written by a client whose clock is ahead would otherwise push the cutoff into the future and close every live session.
+    reference = effective_latest(latest, now_fn() if now_fn is not None else None)
+    cutoff = sweep_cutoff(reference, timeout_s, margin_s)
+    total = SweepResult(cutoff=cutoff, latest=latest, effective_latest=reference)
     if cutoff is None:
         return total
     while total.closed < max_total and not should_stop():

@@ -7,3 +7,6 @@ __pycache__
 .env.local
 
 !.env.example
+
+# local scoring experiment output (scripts/intent_scoring_experiment.py)
+experiment_results/
